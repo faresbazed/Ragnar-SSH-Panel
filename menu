@@ -1,0 +1,79 @@
+#!/bin/bash
+# Ragnar SSH Panel - main menu
+C='\033[0;36m'; G='\033[0;32m'; R='\033[0;31m'; N='\033[0m'
+
+banner() {
+  clear
+  echo -e "${C}==============================================${N}"
+  echo -e "${C}         R A G N A R   S S H   P A N E L${N}"
+  echo -e "${C}==============================================${N}"
+  echo -e "${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300 | DNS :53${N}"
+  echo -e "${C}==============================================${N}"
+}
+
+add_user() {
+  read -p "Username: " u
+  read -sp "Password: " p; echo
+  read -p "Days valid: " d
+  useradd -M -s /bin/false -e "$(date -d "+$d days" +%Y-%m-%d)" "$u" 2>/dev/null || { echo -e "${R}User exists${N}"; return; }
+  echo "$u:$p" | chpasswd
+  mkdir -p /etc/ragnar; echo "$u $(date +%F) +${d}days" >> /etc/ragnar/users.log
+  echo -e "${G}User $u created (expires in $d days)${N}"
+}
+
+del_user() {
+  read -p "Username: " u
+  userdel -r "$u" 2>/dev/null && echo -e "${G}Removed $u${N}" || echo -e "${R}Not found${N}"
+}
+
+list_users() {
+  echo -e "${C}Users (expiry):${N}"
+  awk -F: '$3>=1000 && $7 ~ /false|nologin/ {print "  "$1}' /etc/passwd | while read u; do
+    exp=$(chage -l "$u" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+    echo "  $u  ->  $exp"
+  done
+}
+
+show_payload() {
+  d=$(grep -m1 '^cert' /etc/stunnel/ssh-tls.conf | awk '{print $3}' | sed 's|.*live/||;s|/.*||')
+  echo -e "${G}--- WS PAYLOAD (port 80) ---${N}"
+  echo "GET / HTTP/1.1[crlf]Host: $d[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]"
+  echo -e "${G}--- SSL (port 443) ---${N}"
+  echo "Server: $d  Port: 443  SNI: $d"
+  echo -e "${G}--- DNS TUNNEL (53) ---${N}"
+  echo "Zone: t.$d | Server: ns.$d | target: 127.0.0.1:22"
+  echo -e "${G}--- UDP GW ---${N}"
+  echo "badvpn-udpgw: 127.0.0.1:7300 (enable in tun2socks/HTTP Injector)"
+}
+
+svc_status() {
+  systemctl is-active wsproxy stunnel4 badvpn-udpgw dnstt-server --no-pager 2>/dev/null
+  echo -e "${C}--- listening ---${N}"
+  ss -tlnp | grep -E ':(80|443|22|7300)\b' || true
+  ss -ulnp | grep ':53\b' || true
+}
+
+restart_all() {
+  systemctl restart wsproxy stunnel4 badvpn-udpgw dnstt-server && echo -e "${G}Restarted${N}"
+}
+
+renew_cert() {
+  certbot renew --force-renewal && systemctl restart stunnel4 && echo -e "${G}Cert renewed${N}"
+}
+
+banner
+while true; do
+  echo "  1) Add user        4) Payloads"
+  echo "  2) Delete user     5) Service status"
+  echo "  3) List users      6) Restart all"
+  echo "                      7) Renew cert"
+  echo "                      0) Exit"
+  read -p "  > " o
+  case $o in
+    1) add_user;; 2) del_user;; 3) list_users;;
+    4) show_payload;; 5) svc_status;; 6) restart_all;;
+    7) renew_cert;; 0) echo "Bye"; exit 0;;
+    *) echo -e "${R}Invalid${N}";;
+  esac
+  echo; read -p "  [Enter] to continue..." x; banner
+done
