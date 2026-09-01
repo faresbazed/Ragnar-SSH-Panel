@@ -132,9 +132,11 @@ info "Setting up dnstt (DNS tunnel)..."
 if ! command -v dnstt-server >/dev/null 2>&1; then
   apt-get install -y golang-go >> /tmp/ragnar-install.log 2>&1 || true
   rm -rf /tmp/dnstt
-  git clone --depth 1 https://github.com/bamsoftware/dnstt.git /tmp/dnstt >> /tmp/ragnar-install.log 2>&1 \
-    || warn "dnstt clone failed"
-  cd /tmp/dnstt && go build ./dnstt-server >> /tmp/ragnar-install.log 2>&1 || warn "dnstt build failed"
+  # 1) try maintained GitHub mirror, 2) fall back to author's tarball (no git auth)
+  (git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >> /tmp/ragnar-install.log 2>&1 \
+    || (wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip \
+        && cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt)) || warn "dnstt download failed"
+  cd /tmp/dnstt 2>/dev/null && go build ./dnstt-server >> /tmp/ragnar-install.log 2>&1 || warn "dnstt build failed"
   [ -f /tmp/dnstt/dnstt-server ] && install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
 fi
 mkdir -p /etc/dnstt
@@ -156,6 +158,8 @@ EOF
 sed -i "s/NS_ZONE/t.$DOMAIN/" /etc/systemd/system/dnstt-server.service
 iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
 iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+ok "dnstt configured"
+
 
 # ---------- firewall ----------
 ufw allow 22/tcp,80/tcp,443/tcp,7300/tcp >/dev/null 2>&1
