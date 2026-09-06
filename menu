@@ -37,13 +37,11 @@ add_user() {
   if ! useradd -M -s /bin/false -e "$(date -d "+$d days" +%Y-%m-%d)" "$u" 2>/dev/null; then
     echo -e "${R}Failed to create user '$u' (invalid name?)${N}"; return
   fi
-  # Set password; if chpasswd fails (e.g. password contains username),
-  # roll back the user creation so we don't leave a passwordless account.
-  if ! echo "$u:$p" | chpasswd 2>/dev/null; then
+  # Set password directly via usermod + openssl hash (bypasses PAM checks)
+  HASH=$(openssl passwd -6 "$p")
+  if ! usermod -p "$HASH" "$u" 2>/dev/null; then
     userdel "$u" 2>/dev/null
-    echo -e "${R}Password rejected by PAM (too weak or contains username).${N}"
-    echo -e "${R}User not created. Try a stronger password.${N}"
-    return
+    echo -e "${R}Failed to set password for '$u'${N}"; return
   fi
   mkdir -p /etc/ragnar
   echo "$u $(date +%F) +${d}days" >> /etc/ragnar/users.log
