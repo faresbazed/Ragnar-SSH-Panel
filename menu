@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================================
 #   RAGNAR SSH PANEL - Main Menu
-#   Owner: @faresbazed
+#   Owner: @farisbazed
 #   Channel: https://t.me/ragnaresim
 # ==========================================================
 
@@ -16,7 +16,7 @@ D='\033[0;90m'    # Dark gray
 N='\033[0m'       # Reset
 
 # --- Branding ---
-OWNER_TG="@faresbazed"
+OWNER_TG="@farisbazed"
 CHANNEL_TG="https://t.me/ragnaresim"
 
 banner() {
