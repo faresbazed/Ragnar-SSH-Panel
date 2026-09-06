@@ -94,7 +94,11 @@ show_payload() {
 svc_status() {
   echo -e "${C}--- services ---${N}"
   for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
-    st=$(systemctl is-active "$svc" 2>/dev/null || echo "not-found")
+    if ! systemctl cat "$svc" >/dev/null 2>&1; then
+      printf "  %-18s ${Y}not installed${N}\n" "$svc"
+      continue
+    fi
+    st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     case "$st" in
       active)   printf "  %-18s ${G}%s${N}\n" "$svc" "$st" ;;
       inactive|failed) printf "  %-18s ${R}%s${N}\n" "$svc" "$st" ;;
@@ -108,9 +112,23 @@ svc_status() {
 
 restart_all() {
   systemctl daemon-reload
-  systemctl restart wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null \
-    && echo -e "${G}All services restarted${N}" \
-    || echo -e "${Y}Some services failed to restart (check: menu -> 5)${N}"
+  local ok_count=0 fail_count=0
+  for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
+    if ! systemctl cat "$svc" >/dev/null 2>&1; then
+      continue
+    fi
+    if systemctl restart "$svc" 2>/dev/null; then
+      ok_count=$((ok_count+1))
+    else
+      fail_count=$((fail_count+1))
+      echo -e "  ${R}$svc failed to restart${N}"
+    fi
+  done
+  if [ "$fail_count" -eq 0 ]; then
+    echo -e "${G}All services restarted ($ok_count)${N}"
+  else
+    echo -e "${Y}$ok_count restarted, $fail_count failed (check: menu -> 5)${N}"
+  fi
 }
 
 renew_cert() {
