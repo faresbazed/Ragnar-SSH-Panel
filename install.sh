@@ -129,6 +129,26 @@ else
 fi
 
 # ---------- stunnel 443 SNI ----------
+# On Ubuntu 24.04 the default /etc/stunnel/stunnel.conf ships broken and
+# crashes the service. Replace it entirely with our config so only
+# our SSH-TLS tunnel is loaded.
+cat > /etc/stunnel/stunnel.conf <<EOF
+; Ragnar SSH Panel - SSH over TLS on 443 (SNI: $DOMAIN)
+; Replaces the broken default config shipped on Ubuntu 24.04
+
+; --- global options ---
+cert     = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
+key      = /etc/letsencrypt/live/$DOMAIN/privkey.pem
+pid      = /var/run/stunnel4/stunnel4.pid
+output   = /var/log/stunnel4/stunnel.log
+
+; --- SSH over TLS ---
+[ssh-tls]
+accept  = 443
+connect = 127.0.0.1:22
+EOF
+
+# Also write ssh-tls.conf for reference / menu parsing
 cat > /etc/stunnel/ssh-tls.conf <<EOF
 ; Ragnar SSH Panel - SSH over TLS on 443 (SNI: $DOMAIN)
 [ssh-tls]
@@ -137,10 +157,26 @@ connect = 127.0.0.1:22
 cert    = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
 key     = /etc/letsencrypt/live/$DOMAIN/privkey.pem
 EOF
+
+# Ensure ENABLED=1 in the default config
 sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
+# Ensure the log + pid directories exist (missing on some installs)
+mkdir -p /var/log/stunnel4 /var/run/stunnel4
+chown -R stunnel4:stunnel4 /var/log/stunnel4 /var/run/stunnel4 2>/dev/null || true
+
 systemctl enable stunnel4 >/dev/null 2>&1
-systemctl restart stunnel4
-ok "stunnel4 on 443"
+if systemctl restart stunnel4 2>/dev/null; then
+  ok "stunnel4 on 443"
+else
+  # Retry after a short delay (sometimes the port isn't released yet)
+  sleep 2
+  if systemctl restart stunnel4 2>/dev/null; then
+    ok "stunnel4 on 443 (started on retry)"
+  else
+    warn "stunnel4 failed to start - check: journalctl -xeu stunnel4"
+    warn "  common fixes: ensure port 443 is free, certs exist at /etc/letsencrypt/live/$DOMAIN/"
+  fi
+fi
 
 # ---------- wsproxy.service (port 80) ----------
 cat > /etc/systemd/system/wsproxy.service <<'EOF'
