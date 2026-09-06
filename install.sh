@@ -128,6 +128,24 @@ else
   die "Certbot failed - see $LOGFILE"
 fi
 
+# ---------- Auto-renewal hook ----------
+# certbot.timer runs twice daily and renews certs 30 days before expiry,
+# but it does NOT restart stunnel4 by default. We install a deploy hook
+# so stunnel4 picks up the new cert automatically after each renewal.
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/ragnar-restart.sh <<'HOOKEOF'
+#!/bin/bash
+# Ragnar SSH Panel - auto-restart services after cert renewal
+logger -t ragnar "Cert renewed by certbot, restarting stunnel4 + wsproxy"
+systemctl restart stunnel4 2>/dev/null || true
+systemctl restart wsproxy 2>/dev/null || true
+HOOKEOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/ragnar-restart.sh
+# Make sure the certbot systemd timer is enabled
+systemctl enable certbot.timer >/dev/null 2>&1 || true
+systemctl start certbot.timer >/dev/null 2>&1 || true
+ok "Auto-renewal enabled (certbot.timer + deploy hook restarts stunnel4)"
+
 # ---------- stunnel 443 SNI ----------
 # On Ubuntu 24.04 the default /etc/stunnel/stunnel.conf ships broken and
 # crashes the service. The init.d script loads ssh-tls.conf (not stunnel.conf),
