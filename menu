@@ -78,7 +78,7 @@ _get_username() {
 
 show_payload() {
   # Extract domain from stunnel config; fall back to hostname
-  d=$(grep -m1 '^cert' /etc/stunnel/ssh-tls.conf 2>/dev/null | awk '{print $3}' | sed 's|.*live/||;s|/.*||')
+  d=$(grep -m1 '^\s*cert' /etc/stunnel/ssh-tls.conf 2>/dev/null | awk '{print $3}' | sed 's|.*live/||;s|/.*||')
   [ -z "$d" ] && d=$(hostname -f 2>/dev/null || hostname)
   echo -e "${G}--- WS PAYLOAD (port 80) ---${N}"
   # NOTE: [crlf] is literal text for the client, NOT a bash array subscript

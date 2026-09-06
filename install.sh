@@ -130,11 +130,12 @@ fi
 
 # ---------- stunnel 443 SNI ----------
 # On Ubuntu 24.04 the default /etc/stunnel/stunnel.conf ships broken and
-# crashes the service. Replace it entirely with our config so only
-# our SSH-TLS tunnel is loaded.
-cat > /etc/stunnel/stunnel.conf <<EOF
+# crashes the service. The init.d script loads ssh-tls.conf (not stunnel.conf),
+# so we must write the FULL config (with pid=) to BOTH files.
+# Without pid= the init.d script fails with "check that you have specified the pid=".
+
+STUNNEL_CONF="
 ; Ragnar SSH Panel - SSH over TLS on 443 (SNI: $DOMAIN)
-; Replaces the broken default config shipped on Ubuntu 24.04
 
 ; --- global options ---
 cert     = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
@@ -146,17 +147,11 @@ output   = /var/log/stunnel4/stunnel.log
 [ssh-tls]
 accept  = 443
 connect = 127.0.0.1:22
-EOF
+"
 
-# Also write ssh-tls.conf for reference / menu parsing
-cat > /etc/stunnel/ssh-tls.conf <<EOF
-; Ragnar SSH Panel - SSH over TLS on 443 (SNI: $DOMAIN)
-[ssh-tls]
-accept  = 443
-connect = 127.0.0.1:22
-cert    = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
-key     = /etc/letsencrypt/live/$DOMAIN/privkey.pem
-EOF
+# Write the full config to BOTH files - init.d reads ssh-tls.conf on Ubuntu 24.04
+echo "$STUNNEL_CONF" > /etc/stunnel/stunnel.conf
+echo "$STUNNEL_CONF" > /etc/stunnel/ssh-tls.conf
 
 # Ensure ENABLED=1 in the default config
 sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
