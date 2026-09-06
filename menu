@@ -198,10 +198,6 @@ svc_status() {
       *) printf "  ${Y}● %-16s %s${N}\n" "$svc" "$st" ;;
     esac
   done
-  echo ""
-  echo -e "${C}── Listening Ports ──${N}"
-  ss -tlnp 2>/dev/null | grep -E ':(80|443|22|7300)\b' | awk '{printf "  ${G}●${N} %s\n", $0}' | sed 's/\$/ /' || echo -e "  ${Y}(none)${N}"
-  ss -ulnp 2>/dev/null | grep ':53\b' | awk '{printf "  ${G}●${N} %s\n", $0}' | sed 's/\$/ /' || true
 }
 
 server_stats() {
