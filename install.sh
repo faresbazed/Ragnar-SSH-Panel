@@ -35,8 +35,20 @@ info "Detected: $PRETTY_NAME"
 
 info "Installing packages (may take a few minutes)..."
 apt-get update -y >> "$LOGFILE" 2>&1
-apt-get install -y curl wget git unzip python3 stunnel4 certbot ufw netfilter-persistent iptables-persistent >> "$LOGFILE" 2>&1 \
+
+# Core packages (no conflict risk)
+apt-get install -y curl wget git unzip python3 stunnel4 certbot ufw >> "$LOGFILE" 2>&1 \
   || die "apt install failed - see $LOGFILE"
+
+# iptables-persistent / netfilter-persistent conflict with ufw on Ubuntu 24.04+.
+# Install them separately; if they conflict, we persist iptables via a systemd
+# unit instead (see PERSIST_IPTABLES below).
+PERSIST_IPTABLES="no"
+if apt-get install -y iptables-persistent >> "$LOGFILE" 2>&1; then
+  PERSIST_IPTABLES="yes"
+else
+  warn "iptables-persistent unavailable (ufw conflict on Noble) - using systemd unit for rule persistence"
+fi
 ok "Packages installed"
 
 # ---------- badvpn-udpgw (fixed build) ----------
@@ -205,7 +217,30 @@ sed -i "s|NS_ZONE|t.$DOMAIN|" /etc/systemd/system/dnstt-server.service
 # iptables redirect 53 -> 5300, then persist so it survives reboot
 iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
   iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-netfilter-persistent save >/dev/null 2>&1 || true
+
+if [ "$PERSIST_IPTABLES" = "yes" ] && command -v netfilter-persistent >/dev/null 2>&1; then
+  # iptables-persistent is installed - use it to save rules
+  netfilter-persistent save >/dev/null 2>&1 || true
+else
+  # No iptables-persistent (ufw conflict on Noble) - create a systemd unit
+  # that re-applies the DNAT rule on every boot.
+  cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
+[Unit]
+Description=Ragnar SSH Panel - iptables DNAT rule for dnstt (53->5300)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+ExecStop=/sbin/iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable ragnar-iptables >/dev/null 2>&1 || true
+fi
 ok "dnstt configured"
 
 
