@@ -153,37 +153,6 @@ edit_user() {
   esac
 }
 
-# ==========================================================
-#   PAYLOADS & STATUS
-# ==========================================================
-
-show_payload() {
-  d=$(get_domain)
-  echo ""
-  echo -e "${G}╔═══ WS PAYLOAD (port 80) ═══════════════════╗${N}"
-  printf '%bGET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]%b\n' "${W}" "$d" "${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  echo ""
-  echo -e "${G}╔═══ POST PAYLOAD (HTTP Injector) ═══════════╗${N}"
-  printf '%bPOST / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]%b\n' "${W}" "$d" "${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  echo ""
-  echo -e "${G}╔═══ CF-RAY FRONTING ════════════════════════╗${N}"
-  printf '%bPOST / HTTP/1.1[crlf]Host: [fronting_domain][crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf]User-Agent: [ua][crlf][crlf]%b\n' "${W}" "$d" "${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  echo ""
-  echo -e "${G}╔═══ SSL/TLS (port 443) ═════════════════════╗${N}"
-  echo -e "${W}  Server: $d${N}"
-  echo -e "${W}  Port: 443  SNI: $d${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  echo ""
-  echo -e "${G}╔═══ UDP GW (badvpn) ════════════════════════╗${N}"
-  echo -e "${W}  badvpn-udpgw: 127.0.0.1:7300${N}"
-  echo -e "${W}  (enable in tun2socks / HTTP Injector)${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  echo ""
-}
-
 svc_status() {
   echo -e "${C}── Service Status ──${N}"
   for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
@@ -276,17 +245,17 @@ while true; do
   echo -e "  ${G}1${N}) Add user          ${G}4${N}) Edit user"
   echo -e "  ${G}2${N}) Delete user       ${G}3${N}) List users"
   echo -e "  ${C}━━━ Panel & Server ━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${G}5${N}) Payloads          ${G}6${N}) Service status"
-  echo -e "  ${G}7${N}) Restart all       ${G}8${N}) Server stats"
-  echo -e "  ${G}9${N}) Renew cert       ${G}10${N}) Uninstall"
+  echo -e "  ${G}5${N}) Service status    ${G}6${N}) Restart all"
+  echo -e "  ${G}7${N}) Server stats      ${G}8${N}) Renew cert"
+  echo -e "  ${G}9${N}) Uninstall"
   echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${R}0${N}) Exit"
   echo ""
   read -r -p "  > " o
   case "$o" in
     1) add_user;; 2) del_user;; 3) list_users;; 4) edit_user;;
-    5) show_payload;; 6) svc_status;; 7) restart_all;; 8) server_stats;;
-    9) renew_cert;; 10) uninstall;;
+    5) svc_status;; 6) restart_all;; 7) server_stats;; 8) renew_cert;;
+    9) uninstall;;
     0) echo -e "${P}  Bye! - $OWNER_TG | $CHANNEL_TG${N}"; exit 0;;
     *) echo -e "${R}  Invalid option${N}";;
   esac
