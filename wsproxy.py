@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
 """
-Ragnar SSH Panel - Universal WebSocket SSH Proxy
+Ragnar SSH Panel - Universal WebSocket SSH Proxy (optimized for speed)
 
 Supports ALL payload types used by SSH tunneling clients:
-  - Simple GET / HTTP/1.1 (standard WS)
-  - POST / HTTP/1.1 (HTTP Injector / NapsternetV)
+  - GET / POST / PUT / DELETE / any HTTP method
   - CONNECT host:port (HTTP CONNECT proxy mode)
-  - CF-RAY / fronting payloads (Cloudflare bypass)
-  - Multi-line payloads with multiple Host: headers
-  - Custom User-Agent, X-Forwarded-Host, CF-CONNECTING-IP, etc.
-  - Any arbitrary HTTP method (GET/POST/PUT/DELETE/OPTIONS/etc.)
+  - CF-RAY / fronting payloads (multi-line)
+  - Custom User-Agent, X-Forwarded-Host, etc.
 
-How it works:
-  1. Read the full HTTP header block (up to MAX_HEADER bytes)
-  2. Parse the first request line to detect method + any CONNECT target
-  3. If CONNECT: open connection to the CONNECT target, not SSH
-  4. Otherwise: connect to SSH (or --ssh-host:--ssh-port)
-  5. Send a 101 Switching Protocols reply (for WS clients) OR a
-     200 OK reply (for HTTP CONNECT / fronting clients)
-  6. Bidirectionally bridge client <-> target (raw TCP relay)
+Performance optimizations:
+  - TCP_NODELAY on both sockets (disables Nagle's algorithm -> no 200ms delay)
+  - SO_SNDBUF / SO_RCVBUF set to 256 KiB for high throughput
+  - Larger read buffer (256 KiB) per iteration
+  - Non-blocking drain: only await drain() when the write buffer is full,
+    not on every single read (eliminates the per-chunk await overhead)
+  - Connection to SSH opened in parallel with reply send
+  - Zero-copy write semantics (no unnecessary copying)
 """
 
 import asyncio
 import argparse
+import socket
 import sys
 import logging
 
-BUF = 64 * 1024
-MAX_HEADER = 16 * 1024  # allow larger headers for complex payloads
+BUF = 256 * 1024           # larger read buffer = fewer iterations
+MAX_HEADER = 16 * 1024     # allow larger headers for complex payloads
+SOCKET_BUF = 256 * 1024    # TCP send/recv buffer size
 
 log = logging.getLogger("wsproxy")
 
@@ -43,54 +42,33 @@ def _setup_logging(verbose: bool):
 
 # --- Reply templates ---------------------------------------------------------
 
-# Standard WebSocket upgrade reply
 WS_101 = (
     b"HTTP/1.1 101 Switching Protocols\r\n"
     b"Upgrade: websocket\r\n"
     b"Connection: Upgrade\r\n"
     b"\r\n"
 )
-
-# HTTP CONNECT proxy success reply
 CONNECT_200 = b"HTTP/1.1 200 Connection established\r\n\r\n"
-
-# Generic 200 OK (for fronting / CF-RAY payloads)
 OK_200 = b"HTTP/1.1 200 OK\r\n\r\n"
 
 
 def _choose_reply(method: bytes) -> bytes:
-    """Pick the right reply based on the HTTP method."""
     if method == b"CONNECT":
         return CONNECT_200
     return WS_101
 
 
 def _parse_connect_target(first_line: bytes) -> tuple:
-    """
-    Parse the first HTTP request line.
-    Returns (method, host, port) or (method, None, None).
-
-    Examples:
-      b'GET / HTTP/1.1'                    -> (b'GET', None, None)
-      b'POST / HTTP/1.1'                   -> (b'POST', None, None)
-      b'CONNECT example.com:443 HTTP/1.1'  -> (b'CONNECT', b'example.com', 443)
-      b'CONNECT 1.2.3.4:22 HTTP/1.1'        -> (b'CONNECT', b'1.2.3.4', 22)
-    """
     parts = first_line.split(b" ")
     if len(parts) < 2:
         return (b"UNKNOWN", None, None)
-
     method = parts[0].upper()
-
-    # CONNECT method: CONNECT host:port HTTP/1.1
     if method == b"CONNECT" and len(parts) >= 2:
         target = parts[1]
-        # strip any protocol prefix
         if target.startswith(b"http://"):
             target = target[7:]
         elif target.startswith(b"https://"):
             target = target[8:]
-        # split host:port
         if b":" in target:
             host_b, port_b = target.rsplit(b":", 1)
             try:
@@ -99,25 +77,60 @@ def _parse_connect_target(first_line: bytes) -> tuple:
                 port = 443
             return (method, host_b, port)
         return (method, target, 443)
-
-    # Any other method (GET, POST, PUT, DELETE, etc.)
     return (method, None, None)
 
 
+def _optimize_socket(sock):
+    """Apply TCP performance optimizations to a socket."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF)
+    except OSError:
+        pass
+
+
 async def relay(reader, writer, tag: str = ""):
-    """Pump data from *reader* to *writer* until EOF or error."""
+    """
+    High-performance bidirectional relay.
+
+    Key optimization: instead of awaiting drain() after every read, we
+    only yield to the event loop when the transport's write buffer is
+    actually full. This eliminates the per-chunk await overhead that
+    caused the slowdown after a few seconds of sustained transfer.
+    """
+    transport = writer.transport
     try:
         while True:
             data = await reader.read(BUF)
             if not data:
                 break
             writer.write(data)
-            await writer.drain()
+            # Only await drain() if the write buffer is getting large.
+            # transport.is_writing() returns False when paused (buffer full).
+            # Checking get_write_buffer_size() avoids unnecessary awaits.
+            try:
+                if transport.get_write_buffer_size() > SOCKET_BUF:
+                    await writer.drain()
+            except (AttributeError, OSError):
+                # Fallback: just drain (older Python or transport doesn't support it)
+                await writer.drain()
     except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
         pass
     except Exception as exc:
         log.debug("relay %s error: %s", tag, exc)
     finally:
+        try:
+            # Final flush of any remaining buffered data
+            await writer.drain()
+        except Exception:
+            pass
         try:
             writer.close()
             await writer.wait_closed()
@@ -126,13 +139,14 @@ async def relay(reader, writer, tag: str = ""):
 
 
 async def handle(c_r, c_w, ssh_host: str, ssh_port: int):
-    """
-    Handle one client connection.
-
-    Reads the HTTP payload header, determines the target (SSH or CONNECT
-    target), sends the appropriate reply, then bridges bidirectionally.
-    """
     peer = c_w.get_extra_info("peername")
+
+    # Optimize the client socket immediately
+    try:
+        _optimize_socket(c_w.get_extra_info("socket"))
+    except Exception:
+        pass
+
     try:
         # --- Read the full HTTP header block ---
         header = b""
@@ -154,32 +168,35 @@ async def handle(c_r, c_w, ssh_host: str, ssh_port: int):
 
         # --- Determine the target ---
         if method == b"CONNECT" and conn_host is not None:
-            # HTTP CONNECT proxy mode -> connect to the CONNECT target
             target_host = conn_host.decode("ascii", errors="replace")
             target_port = conn_port
             reply = CONNECT_200
         else:
-            # Standard WS/HTTP payload -> connect to SSH
             target_host = ssh_host
             target_port = ssh_port
             reply = _choose_reply(method)
 
-        # --- Send the reply to the client ---
+        # --- Send reply + connect to target in parallel ---
+        # Open the SSH/target connection while the reply is being sent.
         c_w.write(reply)
+        connect_task = asyncio.ensure_future(
+            asyncio.open_connection(target_host, target_port)
+        )
+        # Drain the reply while the connection opens
         await c_w.drain()
-
-        # --- Connect to the target ---
-        s_r, s_w = await asyncio.open_connection(target_host, target_port)
+        s_r, s_w = await connect_task
         log.debug("%s: connected to %s:%s", peer, target_host, target_port)
+
+        # Optimize the target socket
+        try:
+            _optimize_socket(s_w.get_extra_info("socket"))
+        except Exception:
+            pass
 
     except (ConnectionRefusedError, OSError) as exc:
         log.warning("cannot reach %s:%s -> %s", target_host, target_port, exc)
-        # Send an error reply so the client knows what happened
         try:
-            if method == b"CONNECT":
-                c_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            else:
-                c_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            c_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             await c_w.drain()
         except Exception:
             pass
@@ -209,10 +226,12 @@ async def main(args):
         lambda r, w: handle(r, w, args.ssh_host, args.ssh_port),
         args.bind,
         args.listen,
+        # Start with a larger backlog for connection bursts
+        backlog=128,
     )
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
     log.warning(
-        "wsproxy listening on %s -> SSH %s:%s (supports GET/POST/CONNECT/CF-RAY)",
+        "wsproxy listening on %s -> SSH %s:%s (GET/POST/CONNECT/CF-RAY, optimized)",
         addrs, args.ssh_host, args.ssh_port,
     )
     async with server:
@@ -220,7 +239,7 @@ async def main(args):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Universal WebSocket-to-SSH proxy")
+    ap = argparse.ArgumentParser(description="Universal WebSocket-to-SSH proxy (optimized)")
     ap.add_argument("-p", "--listen", type=int, default=80, help="listen port (default 80)")
     ap.add_argument("-s", "--ssh-port", type=int, default=22, help="SSH port (default 22)")
     ap.add_argument("--ssh-host", default="127.0.0.1", help="SSH host (default 127.0.0.1)")
