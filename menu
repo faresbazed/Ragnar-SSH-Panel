@@ -1,116 +1,233 @@
 #!/bin/bash
-# Ragnar SSH Panel - main menu
-#
-# Improvements over original:
-#   - Fixed SC1087 bug: $d[crlf] was parsed as array subscript -> wrong output
-#   - read -r everywhere (no backslash mangling)
-#   - Better useradd failure detection (not just "exists")
-#   - del_user without -r (users are created with -M, no home dir)
-#   - svc_status shows per-service status with labels
-#   - show_payload falls back gracefully if domain can't be parsed
-#   - renew_cert uses plain renew (no --force-renewal rate-limit risk)
-#   - restart_all does daemon-reload first
-C='\033[0;36m'; G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; N='\033[0m'
+# ==========================================================
+#   RAGNAR SSH PANEL - Main Menu
+#   Owner: @faresbazed
+#   Channel: https://t.me/ragnaresim
+# ==========================================================
+
+# --- Colors ---
+C='\033[0;36m'    # Cyan
+G='\033[0;32m'    # Green
+R='\033[0;31m'    # Red
+Y='\033[0;33m'    # Yellow
+W='\033[1;37m'    # White (bold)
+P='\033[0;35m'    # Purple
+D='\033[0;90m'    # Dark gray
+N='\033[0m'       # Reset
+
+# --- Branding ---
+OWNER_TG="@faresbazed"
+CHANNEL_TG="https://t.me/ragnaresim"
 
 banner() {
   clear
-  echo -e "${C}==============================================${N}"
-  echo -e "${C}         R A G N A R   S S H   P A N E L${N}"
-  echo -e "${C}==============================================${N}"
-  echo -e "${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300 | DNS :53${N}"
-  echo -e "${C}==============================================${N}"
+  echo -e "${P}╔══════════════════════════════════════════════╗${N}"
+  echo -e "${P}║${W}        R A G N A R   S S H   P A N E L        ${P}║${N}"
+  echo -e "${P}╠══════════════════════════════════════════════╣${N}"
+  echo -e "${P}║${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300     ${P}║${N}"
+  echo -e "${P}║${C}  DNS :53 | SSH :22                      ${P}║${N}"
+  echo -e "${P}╠══════════════════════════════════════════════╣${N}"
+  echo -e "${P}║${Y}  Owner : ${W}$OWNER_TG                       ${P}║${N}"
+  echo -e "${P}║${Y}  TG    : ${W}t.me/ragnaresim                  ${P}║${N}"
+  echo -e "${P}╚══════════════════════════════════════════════╝${N}"
+  echo ""
 }
 
+get_domain() {
+  d=$(grep -m1 '^\s*cert' /etc/stunnel/ssh-tls.conf 2>/dev/null | awk '{print $3}' | sed 's|.*live/||;s|/.*||')
+  [ -z "$d" ] && d=$(hostname -f 2>/dev/null || hostname)
+  echo "$d"
+}
+
+# ==========================================================
+#   USER MANAGEMENT
+# ==========================================================
+
 add_user() {
-  read -r -p "Username: " u
-  [ -z "$u" ] && { echo -e "${R}Empty username${N}"; return; }
-  read -r -sp "Password: " p; echo
-  [ -z "$p" ] && { echo -e "${R}Empty password${N}"; return; }
-  read -r -p "Days valid: " d
+  echo -e "${C}── Add User ──${N}"
+  read -r -p "  Username: " u
+  [ -z "$u" ] && { echo -e "${R}  Empty username${N}"; return; }
+  read -r -sp "  Password: " p; echo
+  [ -z "$p" ] && { echo -e "${R}  Empty password${N}"; return; }
+  read -r -p "  Days valid (default 30): " d
   [ -z "$d" ] && d=30
   if ! [[ "$d" =~ ^[0-9]+$ ]]; then
-    echo -e "${R}Invalid number of days${N}"; return
+    echo -e "${R}  Invalid number of days${N}"; return
   fi
   if id "$u" >/dev/null 2>&1; then
-    echo -e "${R}User '$u' already exists${N}"; return
+    echo -e "${R}  User '$u' already exists${N}"; return
   fi
   if ! useradd -M -s /bin/false -e "$(date -d "+$d days" +%Y-%m-%d)" "$u" 2>/dev/null; then
-    echo -e "${R}Failed to create user '$u' (invalid name?)${N}"; return
+    echo -e "${R}  Failed to create user '$u' (invalid name?)${N}"; return
   fi
-  # Set password directly via usermod + openssl hash (bypasses PAM checks)
   HASH=$(openssl passwd -6 "$p")
   if ! usermod -p "$HASH" "$u" 2>/dev/null; then
     userdel "$u" 2>/dev/null
-    echo -e "${R}Failed to set password for '$u'${N}"; return
+    echo -e "${R}  Failed to set password${N}"; return
   fi
   mkdir -p /etc/ragnar
   echo "$u $(date +%F) +${d}days" >> /etc/ragnar/users.log
-  echo -e "${G}User $u created (expires in $d days)${N}"
+  echo -e "${G}  ✓ User '$u' created (expires in $d days)${N}"
 }
 
 del_user() {
-  read -r -p "Username: " u
-  [ -z "$u" ] && { echo -e "${R}Empty username${N}"; return; }
+  echo -e "${C}── Delete User ──${N}"
+  read -r -p "  Username: " u
+  [ -z "$u" ] && { echo -e "${R}  Empty username${N}"; return; }
   if ! id "$u" >/dev/null 2>&1; then
-    echo -e "${R}User '$u' not found${N}"; return
+    echo -e "${R}  User '$u' not found${N}"; return
   fi
-  # Users are created with -M (no home), so don't use -r
-  userdel "$u" 2>/dev/null && echo -e "${G}Removed $u${N}" || echo -e "${R}Failed to remove $u${N}"
+  userdel "$u" 2>/dev/null && echo -e "${G}  ✓ Removed '$u'${N}" || echo -e "${R}  Failed to remove '$u'${N}"
 }
 
 list_users() {
-  echo -e "${C}Users (expiry):${N}"
+  echo -e "${C}── Users ──${N}"
+  echo -e "  ${D}Name                Expiry          Status${N}"
+  echo -e "  ${D}─────────────────────────────────────────${N}"
   local found=0
   while IFS=: read -r _ _ uid _ _ _ shell _; do
     if [ "$uid" -ge 1000 ] 2>/dev/null && [[ "$shell" == *false* || "$shell" == *nologin* ]]; then
-      # shellcheck disable=SC2312
-      exp=$(chage -l "$(_get_username "$uid")" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
-      echo "  $(_get_username "$uid")  ->  ${exp:-unknown}"
+      # shellcheck disable=SC2094
+      uname=$(awk -F: -v uid="$uid" '$3==uid{print $1; exit}' /etc/passwd)
+      exp=$(chage -l "$uname" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+      # Check if expired
+      if [ -n "$exp" ] && [ "$exp" != "never" ]; then
+        if [ "$(date -d "$exp" +%s 2>/dev/null)" -lt "$(date +%s)" ]; then
+          status="${R}expired${N}"
+        else
+          status="${G}active${N}"
+        fi
+      else
+        status="${G}active${N}"
+      fi
+      printf "  ${W}%-18s${N} %-14s %b\n" "$uname" "${exp:-unknown}" "$status"
       found=1
     fi
   done < /etc/passwd
   [ "$found" -eq 0 ] && echo -e "  ${Y}(no panel users)${N}"
 }
 
-_get_username() {
-  awk -F: -v uid="$1" '$3==uid{print $1; exit}' /etc/passwd
+edit_user() {
+  echo -e "${C}── Edit User ──${N}"
+  read -r -p "  Username: " u
+  [ -z "$u" ] && { echo -e "${R}  Empty username${N}"; return; }
+  if ! id "$u" >/dev/null 2>&1; then
+    echo -e "${R}  User '$u' not found${N}"; return
+  fi
+  echo -e "  ${Y}1${N}) Change password"
+  echo -e "  ${Y}2${N}) Extend expiry"
+  echo -e "  ${Y}3${N}) Lock account"
+  echo -e "  ${Y}4${N}) Unlock account"
+  echo -e "  ${Y}0${N}) Cancel"
+  read -r -p "  > " choice
+  case "$choice" in
+    1)
+      read -r -sp "  New password: " np; echo
+      [ -z "$np" ] && { echo -e "${R}  Empty password${N}"; return; }
+      HASH=$(openssl passwd -6 "$np")
+      usermod -p "$HASH" "$u" 2>/dev/null && echo -e "${G}  ✓ Password changed for '$u'${N}" || echo -e "${R}  Failed${N}"
+      ;;
+    2)
+      read -r -p "  Add days (default 30): " add
+      [ -z "$add" ] && add=30
+      if ! [[ "$add" =~ ^[0-9]+$ ]]; then
+        echo -e "${R}  Invalid number${N}"; return
+      fi
+      # Get current expiry, add days
+      cur_exp=$(chage -l "$u" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+      if [ -n "$cur_exp" ] && [ "$cur_exp" != "never" ]; then
+        new_exp=$(date -d "$cur_exp + $add days" +%Y-%m-%d 2>/dev/null)
+      else
+        new_exp=$(date -d "+$add days" +%Y-%m-%d)
+      fi
+      chage -E "$new_exp" "$u" 2>/dev/null && echo -e "${G}  ✓ '$u' expiry extended to $new_exp${N}" || echo -e "${R}  Failed${N}"
+      ;;
+    3)
+      usermod -L "$u" 2>/dev/null && echo -e "${G}  ✓ Account '$u' locked${N}" || echo -e "${R}  Failed${N}"
+      ;;
+    4)
+      usermod -U "$u" 2>/dev/null && echo -e "${G}  ✓ Account '$u' unlocked${N}" || echo -e "${R}  Failed${N}"
+      ;;
+    0) return ;;
+    *) echo -e "${R}  Invalid option${N}" ;;
+  esac
 }
 
+# ==========================================================
+#   PAYLOADS & STATUS
+# ==========================================================
+
 show_payload() {
-  # Extract domain from stunnel config; fall back to hostname
-  d=$(grep -m1 '^\s*cert' /etc/stunnel/ssh-tls.conf 2>/dev/null | awk '{print $3}' | sed 's|.*live/||;s|/.*||')
-  [ -z "$d" ] && d=$(hostname -f 2>/dev/null || hostname)
-  echo -e "${G}--- WS PAYLOAD (port 80) ---${N}"
-  # NOTE: [crlf] is literal text for the client, NOT a bash array subscript
-  printf 'GET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]\n' "$d"
-  echo -e "${G}--- SSL (port 443) ---${N}"
-  echo "Server: $d  Port: 443  SNI: $d"
-  echo -e "${G}--- DNS TUNNEL (53) ---${N}"
-  echo "Zone: t.$d | Server: ns.$d | target: 127.0.0.1:22"
-  echo -e "${G}--- UDP GW ---${N}"
-  echo "badvpn-udpgw: 127.0.0.1:7300 (enable in tun2socks/HTTP Injector)"
+  d=$(get_domain)
+  echo ""
+  echo -e "${G}╔═══ WS PAYLOAD (port 80) ═══════════════════╗${N}"
+  printf '%bGET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]%b\n' "${W}" "$d" "${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  echo ""
+  echo -e "${G}╔═══ POST PAYLOAD (HTTP Injector) ═══════════╗${N}"
+  printf '%bPOST / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]%b\n' "${W}" "$d" "${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  echo ""
+  echo -e "${G}╔═══ CF-RAY FRONTING ════════════════════════╗${N}"
+  printf '%bPOST / HTTP/1.1[crlf]Host: [fronting_domain][crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf]User-Agent: [ua][crlf][crlf]%b\n' "${W}" "$d" "${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  echo ""
+  echo -e "${G}╔═══ SSL/TLS (port 443) ═════════════════════╗${N}"
+  echo -e "${W}  Server: $d${N}"
+  echo -e "${W}  Port: 443  SNI: $d${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  echo ""
+  echo -e "${G}╔═══ UDP GW (badvpn) ════════════════════════╗${N}"
+  echo -e "${W}  badvpn-udpgw: 127.0.0.1:7300${N}"
+  echo -e "${W}  (enable in tun2socks / HTTP Injector)${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  echo ""
 }
 
 svc_status() {
-  echo -e "${C}--- services ---${N}"
+  echo -e "${C}── Service Status ──${N}"
   for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
     if ! systemctl cat "$svc" >/dev/null 2>&1; then
-      printf "  %-18s ${Y}not installed${N}\n" "$svc"
+      printf "  ${D}%-16s not installed${N}\n" "$svc"
       continue
     fi
     st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     case "$st" in
-      active)   printf "  %-18s ${G}%s${N}\n" "$svc" "$st" ;;
-      inactive|failed) printf "  %-18s ${R}%s${N}\n" "$svc" "$st" ;;
-      *) printf "  %-18s ${Y}%s${N}\n" "$svc" "$st" ;;
+      active)   printf "  ${G}● %-16s %s${N}\n" "$svc" "$st" ;;
+      inactive|failed) printf "  ${R}● %-16s %s${N}\n" "$svc" "$st" ;;
+      *) printf "  ${Y}● %-16s %s${N}\n" "$svc" "$st" ;;
     esac
   done
-  echo -e "${C}--- listening ---${N}"
-  ss -tlnp 2>/dev/null | grep -E ':(80|443|22|7300)\b' || echo "  (no TCP listeners on panel ports)"
-  ss -ulnp 2>/dev/null | grep ':53\b' || echo "  (no UDP listener on 53)"
+  echo ""
+  echo -e "${C}── Listening Ports ──${N}"
+  ss -tlnp 2>/dev/null | grep -E ':(80|443|22|7300)\b' | awk '{printf "  ${G}●${N} %s\n", $0}' | sed 's/\$/ /' || echo -e "  ${Y}(none)${N}"
+  ss -ulnp 2>/dev/null | grep ':53\b' | awk '{printf "  ${G}●${N} %s\n", $0}' | sed 's/\$/ /' || true
+}
+
+server_stats() {
+  echo -e "${C}── Server Stats ──${N}"
+  # Uptime
+  up=$(uptime -p 2>/dev/null || uptime 2>/dev/null | awk -F'load average: {print $1}')
+  echo -e "  ${W}Uptime:${N} $up"
+  # CPU
+  cpu_load=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null)
+  echo -e "  ${W}Load:   ${N} $cpu_load"
+  # Memory
+  mem=$(free -h 2>/dev/null | awk '/^Mem:/{printf "%s / %s", $3, $2}')
+  echo -e "  ${W}Memory: ${N} $mem"
+  # Disk
+  disk=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s / %s (%s)", $3, $2, $5}')
+  echo -e "  ${W}Disk:   ${N} $disk"
+  # IP
+  ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo -e "  ${W}IP:     ${N} $ip_addr"
+  # Active SSH sessions
+  ssh_sess=$(ss -tnp 2>/dev/null | grep ':22 ' | grep -c ESTAB 2>/dev/null || echo 0)
+  echo -e "  ${W}SSH conns:${N} $ssh_sess"
 }
 
 restart_all() {
+  echo -e "${Y}  Restarting services...${N}"
   systemctl daemon-reload
   local ok_count=0 fail_count=0
   for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
@@ -121,38 +238,63 @@ restart_all() {
       ok_count=$((ok_count+1))
     else
       fail_count=$((fail_count+1))
-      echo -e "  ${R}$svc failed to restart${N}"
+      echo -e "  ${R}✗ $svc failed${N}"
     fi
   done
   if [ "$fail_count" -eq 0 ]; then
-    echo -e "${G}All services restarted ($ok_count)${N}"
+    echo -e "${G}  ✓ All services restarted ($ok_count)${N}"
   else
-    echo -e "${Y}$ok_count restarted, $fail_count failed (check: menu -> 5)${N}"
+    echo -e "${Y}  $ok_count restarted, $fail_count failed${N}"
   fi
 }
 
 renew_cert() {
-  echo -e "${Y}Running certbot renew...${N}"
+  echo -e "${Y}  Running certbot renew...${N}"
   if certbot renew 2>/dev/null && systemctl restart stunnel4 2>/dev/null; then
-    echo -e "${G}Cert renewed & stunnel restarted${N}"
+    echo -e "${G}  ✓ Cert renewed & stunnel restarted${N}"
   else
-    echo -e "${R}Renew failed - run: certbot renew --dry-run${N}"
+    echo -e "${R}  ✗ Renew failed - run: certbot renew --dry-run${N}"
   fi
 }
 
+uninstall() {
+  echo -e "${R}  WARNING: This will remove Ragnar SSH Panel!${N}"
+  read -r -p "  Type 'yes' to confirm: " confirm
+  [ "$confirm" != "yes" ] && { echo -e "${Y}  Cancelled${N}"; return; }
+  systemctl stop wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
+  systemctl disable wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
+  rm -f /etc/systemd/system/{wsproxy,badvpn-udpgw,dnstt-server,ragnar-iptables}.service
+  rm -f /usr/local/bin/{wsproxy.py,menu,ragnar,badvpn-udpgw,dnstt-server}
+  rm -rf /opt/ragnar /etc/ragnar
+  systemctl daemon-reload
+  echo -e "${G}  ✓ Panel removed. (stunnel4, certbot, ufw left installed)${N}"
+}
+
+# ==========================================================
+#   MAIN MENU LOOP
+# ==========================================================
+
 banner
 while true; do
-  echo "  1) Add user        4) Payloads"
-  echo "  2) Delete user     5) Service status"
-  echo "  3) List users      6) Restart all"
-  echo "                      7) Renew cert"
-  echo "                      0) Exit"
+  echo -e "  ${C}━━━ User Management ━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${G}1${N}) Add user          ${G}4${N}) Edit user"
+  echo -e "  ${G}2${N}) Delete user       ${G}3${N}) List users"
+  echo -e "  ${C}━━━ Panel & Server ━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${G}5${N}) Payloads          ${G}6${N}) Service status"
+  echo -e "  ${G}7${N}) Restart all       ${G}8${N}) Server stats"
+  echo -e "  ${G}9${N}) Renew cert       ${G}10${N}) Uninstall"
+  echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${R}0${N}) Exit"
+  echo ""
   read -r -p "  > " o
   case "$o" in
-    1) add_user;; 2) del_user;; 3) list_users;;
-    4) show_payload;; 5) svc_status;; 6) restart_all;;
-    7) renew_cert;; 0) echo "Bye"; exit 0;;
-    *) echo -e "${R}Invalid${N}";;
+    1) add_user;; 2) del_user;; 3) list_users;; 4) edit_user;;
+    5) show_payload;; 6) svc_status;; 7) restart_all;; 8) server_stats;;
+    9) renew_cert;; 10) uninstall;;
+    0) echo -e "${P}  Bye! - $OWNER_TG | $CHANNEL_TG${N}"; exit 0;;
+    *) echo -e "${R}  Invalid option${N}";;
   esac
-  echo; read -r -p "  [Enter] to continue..." _; banner
+  echo ""
+  read -r -p "  [Enter] to continue..." _
+  banner
 done
