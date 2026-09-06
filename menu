@@ -236,6 +236,166 @@ uninstall() {
 }
 
 # ==========================================================
+#   DNSTT - DNS TUNNEL MANAGEMENT
+# ==========================================================
+
+dnstt_menu() {
+  echo -e "${C}── DNS Tunnel (dnstt) ──${N}"
+  if [ -x /usr/local/bin/dnstt-server ]; then
+    echo -e "  ${G}✓ dnstt-server is installed${N}"
+  else
+    echo -e "  ${R}✗ dnstt-server is NOT installed${N}"
+  fi
+  if systemctl cat dnstt-server >/dev/null 2>&1; then
+    st=$(systemctl is-active dnstt-server 2>/dev/null)
+    echo -e "  Service: ${W}$st${N}"
+  else
+    echo -e "  Service: ${D}not configured${N}"
+  fi
+  echo ""
+  echo -e "  ${Y}1${N}) Install dnstt-server"
+  echo -e "  ${Y}2${N}) Configure & start service"
+  echo -e "  ${Y}3${N}) Show DNS records / public key"
+  echo -e "  ${Y}4${N}) Restart dnstt service"
+  echo -e "  ${Y}5${N}) Stop dnstt service"
+  echo -e "  ${Y}0${N}) Back"
+  read -r -p "  > " dc
+  case "$dc" in
+    1) dnstt_install;;
+    2) dnstt_configure;;
+    3) dnstt_info;;
+    4) systemctl restart dnstt-server 2>/dev/null && echo -e "${G}  ✓ dnstt restarted${N}" || echo -e "${R}  Failed (not configured?)${N}";;
+    5) systemctl stop dnstt-server 2>/dev/null && echo -e "${G}  ✓ dnstt stopped${N}" || echo -e "${R}  Failed${N}";;
+    0) return;;
+    *) echo -e "${R}  Invalid option${N}";;
+  esac
+}
+
+dnstt_install() {
+  echo -e "${Y}  Installing dnstt-server (may take a few minutes)...${N}"
+  # Install Go if not present
+  if ! command -v go >/dev/null 2>&1; then
+    echo -e "${C}  Installing golang-go...${N}"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y golang-go >/dev/null 2>&1 || { echo -e "${R}  Failed to install golang-go${N}"; return; }
+  fi
+  # Clone and build
+  rm -rf /tmp/dnstt /tmp/dnstt.zip
+  echo -e "${C}  Downloading dnstt source...${N}"
+  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >/dev/null 2>&1; then
+    :
+  elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip 2>/dev/null; then
+    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) >/dev/null 2>&1
+  else
+    echo -e "${R}  Download failed${N}"; return
+  fi
+  if [ ! -d /tmp/dnstt ]; then
+    echo -e "${R}  Source not found after download${N}"; return
+  fi
+  echo -e "${C}  Building dnstt-server (this may take 1-2 min)...${N}"
+  if ( cd /tmp/dnstt && go build ./dnstt-server >/dev/null 2>&1 ); then
+    if [ -f /tmp/dnstt/dnstt-server ]; then
+      install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
+      rm -rf /tmp/dnstt /tmp/dnstt.zip
+      echo -e "${G}  ✓ dnstt-server installed${N}"
+    else
+      echo -e "${R}  Build succeeded but binary not found${N}"
+    fi
+  else
+    echo -e "${R}  Build failed${N}"
+    echo -e "${Y}  Try manually: cd /tmp/dnstt && go build ./dnstt-server${N}"
+  fi
+}
+
+dnstt_configure() {
+  if [ ! -x /usr/local/bin/dnstt-server ]; then
+    echo -e "${R}  dnstt-server not installed. Use option 1 first.${N}"; return
+  fi
+  d=$(get_domain)
+  echo -e "  Domain detected: ${W}$d${N}"
+  read -r -p "  Use this domain for DNS tunnel? [Y/n]: " use_d
+  if [[ "$use_d" =~ ^[Nn] ]]; then
+    read -r -p "  Enter domain for dnstt: " d
+    [ -z "$d" ] && { echo -e "${R}  Domain required${N}"; return; }
+  fi
+  # Generate keys if not present
+  mkdir -p /etc/dnstt
+  if [ ! -f /etc/dnstt/server.key ]; then
+    echo -e "${C}  Generating dnstt keys...${N}"
+    /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub \
+      || { echo -e "${R}  Key generation failed${N}"; return; }
+    echo -e "${G}  ✓ Keys generated${N}"
+  fi
+  # Create systemd service
+  cat > /etc/systemd/system/dnstt-server.service <<EOF
+[Unit]
+Description=dnstt DNS Tunnel (53/udp)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dnstt-server -udp :5300 -privkey-file /etc/dnstt/server.key t.$d 127.0.0.1:22
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  # iptables redirect 53 -> 5300
+  iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  # Persist iptables rule via systemd unit (works on Ubuntu 24.04 without iptables-persistent)
+  cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
+[Unit]
+Description=Ragnar SSH Panel - iptables DNAT rule for dnstt (53->5300)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+ExecStop=/sbin/iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable dnstt-server ragnar-iptables >/dev/null 2>&1
+  systemctl start ragnar-iptables 2>/dev/null
+  systemctl restart dnstt-server 2>/dev/null
+  if systemctl is-active dnstt-server >/dev/null 2>&1; then
+    echo -e "${G}  ✓ dnstt configured and running on port 53${N}"
+  else
+    echo -e "${R}  dnstt service failed to start${N}"
+    echo -e "${Y}  Check: journalctl -xeu dnstt-server${N}"
+  fi
+}
+
+dnstt_info() {
+  if [ ! -x /usr/local/bin/dnstt-server ]; then
+    echo -e "${R}  dnstt-server not installed${N}"; return
+  fi
+  d=$(get_domain)
+  echo ""
+  echo -e "${G}╔═══ DNS Tunnel Info ════════════════════════╗${N}"
+  echo -e "${W}  DNS Zone : t.$d${N}"
+  echo -e "${W}  NS Server: ns.$d${N}"
+  echo -e "${W}  Target  : 127.0.0.1:22 (SSH)${N}"
+  echo -e "${G}╚══════════════════════════════════════════╝${N}"
+  if [ -f /etc/dnstt/server.pub ]; then
+    echo ""
+    echo -e "${C}  Public key (share with clients):${N}"
+    echo -e "${Y}  $(cat /etc/dnstt/server.pub)${N}"
+  fi
+  echo ""
+  echo -e "${C}  Required DNS records:${N}"
+  echo -e "  ${W}A${N}   ns.$d     -> <your VPS IP>"
+  echo -e "  ${W}NS${N}  t.$d      -> ns.$d"
+  echo ""
+  echo -e "${C}  Client setup:${N}"
+  echo -e "  ${W}dnstt-client -pubkey-file server.pub t.$d 127.0.0.1:1080${N}"
+}
+
+# ==========================================================
 #   MAIN MENU LOOP
 # ==========================================================
 
@@ -247,7 +407,7 @@ while true; do
   echo -e "  ${C}━━━ Panel & Server ━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${G}5${N}) Service status    ${G}6${N}) Restart all"
   echo -e "  ${G}7${N}) Server stats      ${G}8${N}) Renew cert"
-  echo -e "  ${G}9${N}) Uninstall"
+  echo -e "  ${G}9${N}) DNS Tunnel (dnstt)${G}10${N}) Uninstall"
   echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${R}0${N}) Exit"
   echo ""
@@ -255,7 +415,7 @@ while true; do
   case "$o" in
     1) add_user;; 2) del_user;; 3) list_users;; 4) edit_user;;
     5) svc_status;; 6) restart_all;; 7) server_stats;; 8) renew_cert;;
-    9) uninstall;;
+    9) dnstt_menu;; 10) uninstall;;
     0) echo -e "${P}  Bye! - $OWNER_TG | $CHANNEL_TG${N}"; exit 0;;
     *) echo -e "${R}  Invalid option${N}";;
   esac
