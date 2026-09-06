@@ -273,19 +273,42 @@ dnstt_menu() {
 
 dnstt_install() {
   echo -e "${Y}  Installing dnstt-server (may take a few minutes)...${N}"
+
+  # --- Method 1: Try prebuilt binary (fast, no Go needed) ---
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)  PB_URL="https://github.com/Mygod/dnstt/releases/download/v20260501/dnstt-server-linux-amd64" ;;
+    aarch64) PB_URL="https://github.com/Mygod/dnstt/releases/download/v20260501/dnstt-server-linux-arm64" ;;
+    *) PB_URL="" ;;
+  esac
+  if [ -n "$PB_URL" ]; then
+    echo -e "${C}  Trying prebuilt binary ($ARCH)...${N}"
+    if wget -qO /usr/local/bin/dnstt-server "$PB_URL" 2>/dev/null && [ -s /usr/local/bin/dnstt-server ]; then
+      if [ "$(head -c4 /usr/local/bin/dnstt-server 2>/dev/null)" = "$(printf '\177ELF')" ]; then
+        chmod +x /usr/local/bin/dnstt-server
+        echo -e "${G}  ✓ dnstt-server installed (prebuilt binary)${N}"
+        return
+      fi
+      rm -f /usr/local/bin/dnstt-server
+    fi
+    echo -e "${Y}  Prebuilt binary unavailable, falling back to build from source...${N}"
+  fi
+
+  # --- Method 2: Build from source ---
   # Install Go if not present
   if ! command -v go >/dev/null 2>&1; then
     echo -e "${C}  Installing golang-go...${N}"
     apt-get update -y >/dev/null 2>&1
     apt-get install -y golang-go >/dev/null 2>&1 || { echo -e "${R}  Failed to install golang-go${N}"; return; }
   fi
+  echo -e "  Go version: $(go version 2>/dev/null || echo unknown)"
   # Clone and build
   rm -rf /tmp/dnstt /tmp/dnstt.zip
   echo -e "${C}  Downloading dnstt source...${N}"
-  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >/dev/null 2>&1; then
+  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt 2>&1; then
     :
   elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip 2>/dev/null; then
-    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) >/dev/null 2>&1
+    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) 2>/dev/null
   else
     echo -e "${R}  Download failed${N}"; return
   fi
@@ -293,17 +316,23 @@ dnstt_install() {
     echo -e "${R}  Source not found after download${N}"; return
   fi
   echo -e "${C}  Building dnstt-server (this may take 1-2 min)...${N}"
-  if ( cd /tmp/dnstt && go build ./dnstt-server >/dev/null 2>&1 ); then
+  echo -e "  (output shown below for debugging)"
+  echo -e "  ${D}──────────────────────────────────────────${N}"
+  if ( cd /tmp/dnstt && go build -v ./dnstt-server 2>&1 ); then
+    echo -e "  ${D}──────────────────────────────────────────${N}"
     if [ -f /tmp/dnstt/dnstt-server ]; then
       install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
       rm -rf /tmp/dnstt /tmp/dnstt.zip
-      echo -e "${G}  ✓ dnstt-server installed${N}"
+      echo -e "${G}  ✓ dnstt-server installed (built from source)${N}"
     else
+      echo -e "  ${D}──────────────────────────────────────────${N}"
       echo -e "${R}  Build succeeded but binary not found${N}"
     fi
   else
+    echo -e "  ${D}──────────────────────────────────────────${N}"
     echo -e "${R}  Build failed${N}"
-    echo -e "${Y}  Try manually: cd /tmp/dnstt && go build ./dnstt-server${N}"
+    echo -e "${Y}  You can try building manually:${N}"
+    echo -e "  ${W}cd /tmp/dnstt && go build ./dnstt-server${N}"
   fi
 }
 
