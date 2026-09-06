@@ -173,58 +173,69 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-# ---------- dnstt ----------
+# ---------- dnstt (optional - DNS tunnel) ----------
+DNSTT_OK="no"
 info "Setting up dnstt (DNS tunnel)..."
 if ! command -v dnstt-server >/dev/null 2>&1; then
-  apt-get install -y golang-go >> "$LOGFILE" 2>&1 || true
+  apt-get install -y golang-go >> "$LOGFILE" 2>&1 || warn "golang-go install failed"
   rm -rf /tmp/dnstt /tmp/dnstt.zip
   # 1) try maintained GitHub mirror, 2) fall back to author's tarball (no git auth)
   if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >> "$LOGFILE" 2>&1; then
     :
   elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip; then
-    cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt
+    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) >> "$LOGFILE" 2>&1 || true
   else
     warn "dnstt download failed"
   fi
   if [ -d /tmp/dnstt ]; then
     if ( cd /tmp/dnstt && go build ./dnstt-server >> "$LOGFILE" 2>&1 ); then
-      [ -f /tmp/dnstt/dnstt-server ] && install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
+      if [ -f /tmp/dnstt/dnstt-server ]; then
+        install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
+        ok "dnstt-server built and installed"
+        DNSTT_OK="yes"
+      else
+        warn "dnstt-server binary not found after build"
+      fi
     else
-      warn "dnstt build failed"
+      warn "dnstt build failed (DNS tunnel will be skipped - see $LOGFILE)"
     fi
   fi
-fi
-mkdir -p /etc/dnstt
-if [ ! -f /etc/dnstt/server.key ]; then
-  /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub
+else
+  DNSTT_OK="yes"
 fi
 
-cat > /etc/systemd/system/dnstt-server.service <<'EOF'
+# Only configure dnstt service + keys if we actually have the binary
+if [ "$DNSTT_OK" = "yes" ] && [ -x /usr/local/bin/dnstt-server ]; then
+  mkdir -p /etc/dnstt
+  if [ ! -f /etc/dnstt/server.key ]; then
+    /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub \
+      || warn "dnstt key generation failed"
+  fi
+
+  cat > /etc/systemd/system/dnstt-server.service <<EOF
 [Unit]
 Description=dnstt DNS Tunnel (53/udp)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dnstt-server -udp :5300 -privkey-file /etc/dnstt/server.key NS_ZONE 127.0.0.1:22
+ExecStart=/usr/local/bin/dnstt-server -udp :5300 -privkey-file /etc/dnstt/server.key t.$DOMAIN 127.0.0.1:22
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
-# Use | as sed delimiter so domain dots/slashes don't break it
-sed -i "s|NS_ZONE|t.$DOMAIN|" /etc/systemd/system/dnstt-server.service
-# iptables redirect 53 -> 5300, then persist so it survives reboot
-iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
-  iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  # iptables redirect 53 -> 5300, then persist so it survives reboot
+  iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  ok "dnstt configured (DNS tunnel on port 53)"
 
-if [ "$PERSIST_IPTABLES" = "yes" ] && command -v netfilter-persistent >/dev/null 2>&1; then
-  # iptables-persistent is installed - use it to save rules
-  netfilter-persistent save >/dev/null 2>&1 || true
-else
-  # No iptables-persistent (ufw conflict on Noble) - create a systemd unit
-  # that re-applies the DNAT rule on every boot.
-  cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
+  # Persist iptables rules so they survive reboot
+  if [ "$PERSIST_IPTABLES" = "yes" ] && command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  else
+    # No iptables-persistent (ufw conflict on Noble) - systemd unit fallback
+    cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
 [Unit]
 Description=Ragnar SSH Panel - iptables DNAT rule for dnstt (53->5300)
 After=network.target
@@ -238,10 +249,13 @@ ExecStop=/sbin/iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable ragnar-iptables >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl enable ragnar-iptables >/dev/null 2>&1 || true
+  fi
+else
+  warn "dnstt skipped - DNS tunnel unavailable (other features still work)"
+  warn "  You can install it later manually: see https://www.bamsoftware.com/software/dnstt/"
 fi
-ok "dnstt configured"
 
 
 # ---------- firewall ----------
@@ -254,17 +268,25 @@ ufw --force enable >/dev/null 2>&1 || true
 ok "Firewall configured"
 
 systemctl daemon-reload
-systemctl enable wsproxy badvpn-udpgw dnstt-server >/dev/null 2>&1
-systemctl restart wsproxy badvpn-udpgw dnstt-server 2>/dev/null || warn "some services failed to start (check: menu -> 5)"
+systemctl enable wsproxy badvpn-udpgw >/dev/null 2>&1
+systemctl restart wsproxy badvpn-udpgw 2>/dev/null || warn "some services failed to start (check: menu -> 5)"
+
+# Only enable/start dnstt if it was actually installed
+if [ "$DNSTT_OK" = "yes" ]; then
+  systemctl enable dnstt-server >/dev/null 2>&1 || true
+  systemctl restart dnstt-server 2>/dev/null || warn "dnstt-server failed to start"
+fi
 
 echo ""
 echo "=========================================================="
 echo "  RAGNAR SSH PANEL installed"
-echo "   SSH-WS  : 80      DNS-TUN : 53/udp (dnstt)"
+echo "   SSH-WS  : 80      DNS-TUN : 53/udp $( [ "$DNSTT_OK" = "yes" ] && echo '(dnstt)' || echo '(skipped)')"
 echo "   SSH-TLS : 443     UDP-GW  : 7300 (badvpn)"
 echo "   SSH     : 22      Panel   : menu (or ragnar)"
-echo "  Create DNS records for dnstt:"
-echo "   A   ns.$DOMAIN     -> <VPS IP>"
-echo "   NS  t.$DOMAIN      -> ns.$DOMAIN"
+if [ "$DNSTT_OK" = "yes" ]; then
+  echo "  Create DNS records for dnstt:"
+  echo "   A   ns.$DOMAIN     -> <VPS IP>"
+  echo "   NS  t.$DOMAIN      -> ns.$DOMAIN"
+fi
 echo "=========================================================="
 exec /usr/local/bin/menu
