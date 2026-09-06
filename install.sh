@@ -4,25 +4,39 @@
 #   SSH-WS :80 (wsproxy) | SSH-TLS :443 (stunnel+SNI)
 #   badvpn-udpgw :7300 | dnstt :53 | SSH :22
 #   Tested: Debian 11/12, Ubuntu 20.04-24.04
+#
+#   Improvements over original:
+#   - read -r (no backslash mangling on domain/email)
+#   - Input validation for domain & email
+#   - Safe sed delimiter for domain substitution (| not affected by domain chars)
+#   - iptables rules persisted via netfilter-persistent
+#   - exec menu -> exec /usr/local/bin/menu (PATH-hash safe)
+#   - A&&B||C anti-pattern fixed with proper if blocks
+#   - Cleanup of /tmp build dirs on failure
+#   - Better certbot port-80 conflict handling
 # ==========================================================
-set -e
+set -euo pipefail
 C_RED='\033[0;31m'; C_GRN='\033[0;32m'; C_YLW='\033[0;33m'; C_CYN='\033[0;36m'; C_NC='\033[0m'
 ok()  { echo -e "${C_GRN}[ OK ]${C_NC} $1"; }
 info(){ echo -e "${C_CYN}[ .. ]${C_NC} $1"; }
 warn(){ echo -e "${C_YLW}[ !! ]${C_NC} $1"; }
 die() { echo -e "${C_RED}[FAIL]${C_NC} $1"; exit 1; }
 
+LOGFILE="/tmp/ragnar-install.log"
+trap 'rm -rf /tmp/badvpn /tmp/dnstt /tmp/dnstt.zip /tmp/ragnar.zip 2>/dev/null' EXIT
+
 [ "$(id -u)" -ne 0 ] && die "Run as root (sudo -i)."
 export DEBIAN_FRONTEND=noninteractive
 
+# shellcheck source=/dev/null
 . /etc/os-release
 case "$ID" in debian|ubuntu) : ;; *) die "Unsupported OS: $ID" ;; esac
 info "Detected: $PRETTY_NAME"
 
 info "Installing packages (may take a few minutes)..."
-apt-get update -y >> /tmp/ragnar-install.log 2>&1
-apt-get install -y curl wget git unzip python3 stunnel4 certbot ufw >> /tmp/ragnar-install.log 2>&1 \
-  || die "apt install failed - see /tmp/ragnar-install.log"
+apt-get update -y >> "$LOGFILE" 2>&1
+apt-get install -y curl wget git unzip python3 stunnel4 certbot ufw netfilter-persistent iptables-persistent >> "$LOGFILE" 2>&1 \
+  || die "apt install failed - see $LOGFILE"
 ok "Packages installed"
 
 # ---------- badvpn-udpgw (fixed build) ----------
@@ -43,15 +57,17 @@ if ! command -v badvpn-udpgw >/dev/null 2>&1; then
   else
     rm -f /usr/local/bin/badvpn-udpgw
     info "Prebuilt unavailable, building from source (~2 min)..."
-    apt-get install -y build-essential cmake >> /tmp/ragnar-install.log 2>&1
+    apt-get install -y build-essential cmake >> "$LOGFILE" 2>&1
     rm -rf /tmp/badvpn
-    git clone --depth 1 https://github.com/ambrop72/badvpn.git /tmp/badvpn >> /tmp/ragnar-install.log 2>&1 \
+    git clone --depth 1 https://github.com/ambrop72/badvpn.git /tmp/badvpn >> "$LOGFILE" 2>&1 \
       || die "badvpn git clone failed"
-    mkdir -p /tmp/badvpn/build && cd /tmp/badvpn/build
-    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >> /tmp/ragnar-install.log 2>&1 \
-      || die "badvpn cmake failed"
-    make -j"$(nproc)" >> /tmp/ragnar-install.log 2>&1 \
-      || die "badvpn make failed"
+    mkdir -p /tmp/badvpn/build
+    # Use a subshell so a cd failure doesn't affect the rest of the script
+    if ! ( cd /tmp/badvpn/build && \
+           cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >> "$LOGFILE" 2>&1 && \
+           make -j"$(nproc)" >> "$LOGFILE" 2>&1 ); then
+      die "badvpn build failed - see $LOGFILE"
+    fi
     BIN=$(find /tmp/badvpn/build -name badvpn-udpgw -type f | head -n1)
     [ -n "$BIN" ] || die "badvpn binary not found after build"
     install -m 755 "$BIN" /usr/local/bin/badvpn-udpgw
@@ -62,25 +78,43 @@ fi
 # ---------- clone panel ----------
 info "Installing panel to /opt/ragnar ..."
 rm -rf /opt/ragnar
-git clone --depth 1 https://github.com/faresbazed/Ragnar-SSH-Panel.git /opt/ragnar >> /tmp/ragnar-install.log 2>&1 \
-  || { wget -qO /tmp/ragnar.zip https://github.com/faresbazed/Ragnar-SSH-Panel/archive/refs/heads/main.zip \
-       && unzip -qo /tmp/ragnar.zip -d /opt && mv /opt/Ragnar-SSH-Panel-main /opt/ragnar; } \
-  || die "Could not download panel"
+if git clone --depth 1 https://github.com/faresbazed/Ragnar-SSH-Panel.git /opt/ragnar >> "$LOGFILE" 2>&1; then
+  : # clone ok
+elif wget -qO /tmp/ragnar.zip https://github.com/faresbazed/Ragnar-SSH-Panel/archive/refs/heads/main.zip \
+     && unzip -qo /tmp/ragnar.zip -d /opt && mv /opt/Ragnar-SSH-Panel-main /opt/ragnar; then
+  : # zip fallback ok
+else
+  die "Could not download panel"
+fi
 install -m 755 /opt/ragnar/wsproxy.py /usr/local/bin/wsproxy.py
 install -m 755 /opt/ragnar/menu /usr/local/bin/menu     # <-- "menu" command
 install -m 755 /opt/ragnar/menu /usr/local/bin/ragnar   # <-- "ragnar" command
 ok "Panel installed (commands: menu / ragnar)"
 
 # ---------- input ----------
-read -p "Your domain for TLS/SNI (e.g. vpn.example.com): " DOMAIN
-[ -z "$DOMAIN" ] && die "Domain required."
-read -p "Email for Let's Encrypt: " EMAIL
+read -r -p "Your domain for TLS/SNI (e.g. vpn.example.com): " DOMAIN
+[ -n "$DOMAIN" ] || die "Domain required."
+# Basic domain validation
+if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+  die "Invalid domain format: $DOMAIN"
+fi
+read -r -p "Email for Let's Encrypt: " EMAIL
+[ -n "$EMAIL" ] || die "Email required."
+if ! [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+  die "Invalid email format: $EMAIL"
+fi
 
 # ---------- SSL cert (standalone - port 80 must be free) ----------
 info "Issuing Let's Encrypt cert for $DOMAIN ..."
-certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" >> /tmp/ragnar-install.log 2>&1 \
-  || { systemctl stop wsproxy 2>/dev/null; certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" || die "Certbot failed"; }
-ok "Certificate issued"
+# Stop anything that might hold port 80
+systemctl stop wsproxy 2>/dev/null || true
+systemctl stop stunnel4 2>/dev/null || true
+if certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" >> "$LOGFILE" 2>&1; then
+  ok "Certificate issued"
+else
+  warn "Certbot standalone failed - check that port 80 is free and DNS points to this server"
+  die "Certbot failed - see $LOGFILE"
+fi
 
 # ---------- stunnel 443 SNI ----------
 cat > /etc/stunnel/ssh-tls.conf <<EOF
@@ -130,17 +164,28 @@ EOF
 # ---------- dnstt ----------
 info "Setting up dnstt (DNS tunnel)..."
 if ! command -v dnstt-server >/dev/null 2>&1; then
-  apt-get install -y golang-go >> /tmp/ragnar-install.log 2>&1 || true
-  rm -rf /tmp/dnstt
+  apt-get install -y golang-go >> "$LOGFILE" 2>&1 || true
+  rm -rf /tmp/dnstt /tmp/dnstt.zip
   # 1) try maintained GitHub mirror, 2) fall back to author's tarball (no git auth)
-  (git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >> /tmp/ragnar-install.log 2>&1 \
-    || (wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip \
-        && cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt)) || warn "dnstt download failed"
-  cd /tmp/dnstt 2>/dev/null && go build ./dnstt-server >> /tmp/ragnar-install.log 2>&1 || warn "dnstt build failed"
-  [ -f /tmp/dnstt/dnstt-server ] && install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
+  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >> "$LOGFILE" 2>&1; then
+    :
+  elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip; then
+    cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt
+  else
+    warn "dnstt download failed"
+  fi
+  if [ -d /tmp/dnstt ]; then
+    if ( cd /tmp/dnstt && go build ./dnstt-server >> "$LOGFILE" 2>&1 ); then
+      [ -f /tmp/dnstt/dnstt-server ] && install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
+    else
+      warn "dnstt build failed"
+    fi
+  fi
 fi
 mkdir -p /etc/dnstt
-[ -f /etc/dnstt/server.key ] || /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub
+if [ ! -f /etc/dnstt/server.key ]; then
+  /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub
+fi
 
 cat > /etc/systemd/system/dnstt-server.service <<'EOF'
 [Unit]
@@ -155,21 +200,27 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-sed -i "s/NS_ZONE/t.$DOMAIN/" /etc/systemd/system/dnstt-server.service
+# Use | as sed delimiter so domain dots/slashes don't break it
+sed -i "s|NS_ZONE|t.$DOMAIN|" /etc/systemd/system/dnstt-server.service
+# iptables redirect 53 -> 5300, then persist so it survives reboot
 iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
-iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+netfilter-persistent save >/dev/null 2>&1 || true
 ok "dnstt configured"
 
 
 # ---------- firewall ----------
-ufw allow 22/tcp,80/tcp,443/tcp,7300/tcp >/dev/null 2>&1
-ufw allow 53/udp >/dev/null 2>&1
-ufw --force enable >/dev/null 2>&1
+ufw allow 22/tcp >/dev/null 2>&1 || true
+ufw allow 80/tcp >/dev/null 2>&1 || true
+ufw allow 443/tcp >/dev/null 2>&1 || true
+ufw allow 7300/tcp >/dev/null 2>&1 || true
+ufw allow 53/udp >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
 ok "Firewall configured"
 
 systemctl daemon-reload
 systemctl enable wsproxy badvpn-udpgw dnstt-server >/dev/null 2>&1
-systemctl restart wsproxy badvpn-udpgw dnstt-server 2>/dev/null || true
+systemctl restart wsproxy badvpn-udpgw dnstt-server 2>/dev/null || warn "some services failed to start (check: menu -> 5)"
 
 echo ""
 echo "=========================================================="
@@ -181,4 +232,4 @@ echo "  Create DNS records for dnstt:"
 echo "   A   ns.$DOMAIN     -> <VPS IP>"
 echo "   NS  t.$DOMAIN      -> ns.$DOMAIN"
 echo "=========================================================="
-exec menu
+exec /usr/local/bin/menu
