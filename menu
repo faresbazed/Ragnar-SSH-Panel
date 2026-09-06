@@ -318,11 +318,12 @@ dnstt_install() {
   echo -e "${C}  Building dnstt-server (this may take 1-2 min)...${N}"
   echo -e "  (output shown below for debugging)"
   echo -e "  ${D}──────────────────────────────────────────${N}"
-  if ( cd /tmp/dnstt && go build -v ./dnstt-server 2>&1 ); then
+  # Use -o to specify output name because "dnstt-server" is also a source dir
+  if ( cd /tmp/dnstt && go build -v -o /tmp/dnstt-server-bin ./dnstt-server 2>&1 ); then
     echo -e "  ${D}──────────────────────────────────────────${N}"
-    if [ -f /tmp/dnstt/dnstt-server ]; then
-      install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
-      rm -rf /tmp/dnstt /tmp/dnstt.zip
+    if [ -f /tmp/dnstt-server-bin ]; then
+      install -m 755 /tmp/dnstt-server-bin /usr/local/bin/dnstt-server
+      rm -rf /tmp/dnstt /tmp/dnstt.zip /tmp/dnstt-server-bin
       echo -e "${G}  ✓ dnstt-server installed (built from source)${N}"
     else
       echo -e "  ${D}──────────────────────────────────────────${N}"
@@ -332,7 +333,7 @@ dnstt_install() {
     echo -e "  ${D}──────────────────────────────────────────${N}"
     echo -e "${R}  Build failed${N}"
     echo -e "${Y}  You can try building manually:${N}"
-    echo -e "  ${W}cd /tmp/dnstt && go build ./dnstt-server${N}"
+    echo -e "  ${W}cd /tmp/dnstt && go build -o /tmp/dnstt-server-bin ./dnstt-server${N}"
   fi
 }
 
