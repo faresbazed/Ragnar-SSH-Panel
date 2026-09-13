@@ -16,6 +16,7 @@ import socketserver
 import struct
 import subprocess
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -72,7 +73,7 @@ class ConfigurationTests(unittest.TestCase):
                      ('bad', 'tcp', 1234, False), ('vless', 'grpc', 1234, False)]:
             with self.subTest(args=args), self.assertRaises(ValueError):
                 rx.listener(*args)
-        for host in ['../example.com', 'example.com\nfoo', '-bad.example.com', 'https://example.com', 'a..com']:
+        for host in ['../example.com', 'example.com\nfoo', '-bad.example.com', 'https://example.com', 'a..com', '127.0.0.1']:
             with self.assertRaises(ValueError):
                 rx.hostname(host)
         self.assertEqual(rx.hostname('VPN.Example.COM'), 'vpn.example.com')
@@ -216,6 +217,25 @@ class ManagementTests(unittest.TestCase):
         self.stop.assert_called_once()
         self.assertTrue(all(not item['settings']['clients'] for item in json.loads(self.manager.config_path.read_text())['inbounds']))
 
+    def test_renewal_blocks_writes_and_timer_restarts_but_allows_reads(self):
+        marker = self.manager.root / 'renewal-marker'
+        marker.touch()
+        with patch.object(rx, 'RENEWAL_MARKER', marker):
+            self.run_command('sync')
+            self.restart.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'renewal'):
+                self.run_command('disable-user', 'vless-user')
+            self.assertIn('vless-user', self.run_command('users'))
+            self.assertIn('vless://', self.run_command('uri', 'vless-user'))
+
+    def test_expiry_validation_failure_stops_xray(self):
+        state = copy.deepcopy(self.state)
+        state['users'] = []
+        self.validate.side_effect = ValueError('certificate missing')
+        with self.assertRaises(ValueError):
+            self.manager.apply(state, revoke=True)
+        self.stop.assert_called_once()
+
     def test_boot_removes_expired_credentials_before_start(self):
         state = copy.deepcopy(self.state)
         for user in state['users']:
@@ -223,6 +243,96 @@ class ManagementTests(unittest.TestCase):
         rx.atomic(self.manager.state_path, rx.encoded(state))
         self.manager.boot()
         self.assertTrue(all(not item['settings']['clients'] for item in json.loads(self.manager.config_path.read_text())['inbounds']))
+
+
+class RenewalHookTests(unittest.TestCase):
+    """Run the actual installer hook bodies with a sandbox-local fake systemctl."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='.ragnar-tests-', dir=HERE)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.services = self.root / 'services.json'
+        self.services.write_text(json.dumps({'wsproxy': True, 'ragnar-xray': True, 'stunnel4': True}))
+        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'],
+                        HOOK_STATE=str(self.services), PYTHONDONTWRITEBYTECODE='1')
+        fake = self.root / 'systemctl'
+        fake.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            from pathlib import Path
+            path = Path(os.environ['HOOK_STATE'])
+            data = json.loads(path.read_text())
+            command, service = sys.argv[1], sys.argv[-1]
+            if command == 'is-active':
+                sys.exit(0 if data.get(service) else 3)
+            if command == 'start' and service == 'ragnar-xray' and os.environ.get('FAIL_XRAY'):
+                sys.exit(1)
+            if command in ('start', 'stop'):
+                data[service] = command == 'start'
+                path.write_text(json.dumps(data))
+        '''))
+        fake.chmod(0o755)
+        source = (HERE / 'install-xray.sh').read_text()
+        self.hooks = {}
+        for kind, filename in [('pre', 'ragnar-xray.sh'), ('post', 'ragnar-xray.sh'), ('deploy', 'ragnar-restart.sh')]:
+            marker = "cat > /etc/letsencrypt/renewal-hooks/{}/{} <<'HOOK'\n".format(kind, filename)
+            body = source.split(marker, 1)[1].split('\nHOOK\n', 1)[0] + '\n'
+            body = body.replace('/run/ragnar-cert-renew', str(self.root / 'renewal'))
+            body = body.replace('/etc/ragnar/xray/.lock', str(self.root / '.lock'))
+            path = self.root / (kind + '.sh')
+            path.write_text(body)
+            subprocess.run(['bash', '-n', str(path)], check=True)
+            self.hooks[kind] = path
+
+    def run_hook(self, kind, success=True):
+        result = subprocess.run(['bash', str(self.hooks[kind])], env=self.env, timeout=10,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode == 0, success, result.stderr.decode())
+
+    def test_services_restored_after_failed_certificate_attempt(self):
+        self.run_hook('pre')
+        self.assertFalse(json.loads(self.services.read_text())['ragnar-xray'])
+        self.assertFalse(json.loads(self.services.read_text())['wsproxy'])
+        # Certbot post hooks run even if issuance fails; no deploy hook in this case.
+        self.run_hook('post')
+        self.assertTrue(json.loads(self.services.read_text())['ragnar-xray'])
+        self.assertTrue(json.loads(self.services.read_text())['wsproxy'])
+        self.assertFalse((self.root / 'renewal/services').exists())
+
+    def test_deploy_does_not_restart_xray_during_challenge(self):
+        self.run_hook('pre')
+        self.run_hook('deploy')
+        self.assertFalse(json.loads(self.services.read_text())['ragnar-xray'])
+        self.run_hook('post')
+
+    def test_failed_restart_preserves_recovery_marker(self):
+        self.run_hook('pre')
+        self.env['FAIL_XRAY'] = '1'
+        self.run_hook('post', success=False)
+        self.assertTrue((self.root / 'renewal/services').exists())
+        del self.env['FAIL_XRAY']
+        self.run_hook('post')
+        self.assertFalse((self.root / 'renewal/services').exists())
+
+    def test_stopped_services_are_not_started(self):
+        self.services.write_text(json.dumps({'wsproxy': False, 'ragnar-xray': True}))
+        self.run_hook('pre')
+        self.run_hook('post')
+        self.assertFalse(json.loads(self.services.read_text())['wsproxy'])
+        self.assertTrue(json.loads(self.services.read_text())['ragnar-xray'])
+
+    def test_pre_hook_waits_for_management_lock(self):
+        with (self.root / '.lock').open('a') as lock:
+            rx.fcntl.flock(lock, rx.fcntl.LOCK_EX)
+            process = subprocess.Popen(['bash', str(self.hooks['pre'])], env=self.env)
+            try:
+                time.sleep(.15)
+                self.assertIsNone(process.poll())
+                self.assertTrue(json.loads(self.services.read_text())['ragnar-xray'])
+            finally:
+                rx.fcntl.flock(lock, rx.fcntl.LOCK_UN)
+                self.assertEqual(process.wait(timeout=10), 0)
+        self.run_hook('post')
 
 
 class Echo(socketserver.BaseRequestHandler):
