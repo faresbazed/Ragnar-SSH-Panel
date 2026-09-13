@@ -23,7 +23,8 @@ XRAY = '/usr/local/lib/ragnar-xray/xray'
 SERVICE = 'ragnar-xray.service'
 RENEWAL_MARKER = Path('/run/ragnar-cert-renew/services')
 UTC = dt.timezone.utc
-RESERVED = {22, 53, 444, 7300, 8080}
+RESERVED = {22, 53, 7300}
+SSH_SERVICES = {80: 'wsproxy.service', 443: 'stunnel4.service'}
 DEFAULTS = [
     ('vless', 'ws', 80, False), ('vless', 'ws', 443, True),
     ('vmess', 'ws', 8081, False), ('vmess', 'ws', 8443, True),
@@ -81,10 +82,32 @@ def listener(protocol, transport, port, tls, path=None):
             'transport': transport, 'port': port, 'tls': tls, 'path': path}
 
 
+def port_owner(state, port):
+    # Old releases had migrated SSH elsewhere, so absent ownership means Xray.
+    owner = state.get('port_owners', {}).get(str(port), 'xray')
+    if owner not in ('ssh', 'xray'):
+        raise ValueError('Invalid shared-port ownership state.')
+    return owner
+
+
+def listener_enabled(state, item):
+    return item['port'] not in SSH_SERVICES or port_owner(state, item['port']) == 'xray'
+
+
+def service_action(action, service):
+    subprocess.run(['systemctl', action, service], check=True, timeout=45)
+
+
+def service_active(service):
+    return subprocess.run(['systemctl', 'is-active', '--quiet', service], timeout=10).returncode == 0
+
+
 def render(state, now=None):
     now = now or now_utc()
     inbounds = []
     for item in state['listeners']:
+        if not listener_enabled(state, item):
+            continue
         protocol = item['protocol']
         clients = []
         for user in state['users']:
@@ -238,6 +261,42 @@ class Manager:
             raise
         return True
 
+    def switch_ports(self, ports, owner):
+        if any(port not in SSH_SERVICES for port in ports) or owner not in ('ssh', 'xray'):
+            raise ValueError('Select SSH or Xray for port 80, 443 or both.')
+        previous = self.load()
+        state = copy.deepcopy(previous)
+        for port in ports:
+            if owner == 'xray' and not any(item['port'] == port for item in state['listeners']):
+                raise ValueError('Add an Xray listener on port {} before switching.'.format(port))
+            state.setdefault('port_owners', {})[str(port)] = owner
+        self.validate(render(state))
+        was_active = {port: service_active(SSH_SERVICES[port]) for port in ports}
+        try:
+            # Always release the SSH sockets before asking Xray to bind them.
+            for port in ports:
+                service_action('stop', SSH_SERVICES[port])
+                if owner == 'xray' and port_owner(previous, port) == 'ssh':
+                    check_port(port)
+            self.apply(state)
+            for port in ports:
+                if owner == 'ssh':
+                    service_action('start', SSH_SERVICES[port])
+                    if not service_active(SSH_SERVICES[port]):
+                        raise ValueError('SSH service failed on port {}.'.format(port))
+        except Exception as exc:
+            try:
+                for port in ports:
+                    service_action('stop', SSH_SERVICES[port])
+                self.apply(previous)
+                for port, running in was_active.items():
+                    if running:
+                        service_action('start', SSH_SERVICES[port])
+            except Exception as recovery:
+                self.stop()
+                raise ValueError('Port switch AND rollback failed; inspect services before retrying.') from recovery
+            raise ValueError('Port switch failed; previous selection restored: {}'.format(exc)) from exc
+
     def boot(self):
         # Internal ExecStartPre path: do NOT take the caller's management lock.
         # systemctl restart is synchronous while apply() holds that lock.
@@ -260,18 +319,26 @@ def show_uris(state, user):
     if not matches:
         raise ValueError('No listeners for this user protocol. Add a listener first.')
     for item in matches:
+        if not listener_enabled(state, item):
+            print('Port {} is currently assigned to SSH; this URI is saved but inactive.'.format(item['port']), file=sys.stderr)
         print(uri(state, user, item))
 
 
 def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     commands = ap.add_subparsers(dest='command', required=True)
-    setup = commands.add_parser('init', help='Initialize after SSH ports have been migrated')
+    setup = commands.add_parser('init', help='Initialize without changing SSH ports or services')
     setup.add_argument('--domain', required=True)
     setup.add_argument('--certificate', required=True)
     setup.add_argument('--key', required=True)
-    for command in ('users', 'listeners', 'sync', 'render-boot'):
+    for command in ('users', 'listeners', 'sync', 'render-boot', 'ports'):
         commands.add_parser(command)
+    switch = commands.add_parser('switch', help='Assign a shared port to SSH or Xray; accounts are preserved')
+    switch.add_argument('port', choices=['80', '443', 'both'])
+    switch.add_argument('owner', choices=['ssh', 'xray'])
+    switch.add_argument('--yes', action='store_true', help='Confirm disconnection of the service giving up the port')
+    allow = commands.add_parser('allow-ssh', help=argparse.SUPPRESS)
+    allow.add_argument('port', type=int, choices=[80, 443])
     add = commands.add_parser('add-user')
     add.add_argument('name')
     add.add_argument('protocol', choices=['vless', 'vmess', 'trojan'])
@@ -297,7 +364,7 @@ def execute(args, manager):
     # Those hooks take the same management lock, so a timer/account change cannot
     # restart Xray between the stop and the ACME challenge. Boot rendering remains
     # available to the post hook and still filters expired accounts before start.
-    if RENEWAL_MARKER.exists() and args.command not in ('users', 'listeners', 'uri'):
+    if RENEWAL_MARKER.exists() and args.command not in ('users', 'listeners', 'uri', 'ports'):
         if args.command == 'sync':
             return
         raise ValueError('Certificate renewal is in progress. Retry after it completes.')
@@ -309,20 +376,35 @@ def execute(args, manager):
             if not Path(path).is_absolute() or not Path(path).is_file():
                 raise ValueError('Certificate/key must be existing absolute file paths.')
         state = {'version': 1, 'domain': domain, 'certificate': args.certificate,
-                 'key': args.key, 'users': [], 'listeners': [listener(*item) for item in DEFAULTS]}
+                 'key': args.key, 'users': [], 'listeners': [listener(*item) for item in DEFAULTS],
+                 'port_owners': {'80': 'ssh', '443': 'ssh'}}
         for item in state['listeners']:
-            check_port(item['port'])
+            if listener_enabled(state, item):
+                check_port(item['port'])
         manager.apply(state, initialize=True)
         return
     state = manager.load()
     if args.command == 'sync':
         manager.apply(state, revoke=True)
         return
+    if args.command == 'switch':
+        if not args.yes:
+            raise ValueError('Switching disconnects users on the affected ports; pass --yes to confirm.')
+        ports = [80, 443] if args.port == 'both' else [int(args.port)]
+        manager.switch_ports(ports, args.owner)
+        print('Ports {} assigned to {}. All accounts preserved; SSH ports unchanged.'.format(
+            ', '.join(map(str, ports)), args.owner.upper()))
+        return
+    if args.command == 'ports':
+        for port in SSH_SERVICES:
+            print('{}: {} selected'.format(port, port_owner(state, port).upper()))
+        return
     if args.command == 'listeners':
-        print('ID                        PROTOCOL TRANSPORT PORT  SECURITY PATH')
+        print('ID                        PROTOCOL TRANSPORT PORT  SECURITY PATH (availability)')
         for item in state['listeners']:
-            print('{id:25} {protocol:8} {transport:9} {port:<5} {security:8} {path}'.format(
+            print('{id:25} {protocol:8} {transport:9} {port:<5} {security:8} {path} ({availability})'.format(
                 **dict(item, security='TLS' if item['tls'] else 'none',
+                       availability='enabled' if listener_enabled(state, item) else 'saved; SSH owns port',
                        path=item['path'] if item['transport'] == 'ws' else '-')))
         return
     if args.command == 'users':
@@ -364,7 +446,8 @@ def execute(args, manager):
         item = listener(args.protocol, args.transport, args.port, args.tls, args.path)
         if any(existing['port'] == args.port for existing in state['listeners']):
             raise ValueError('This port already has a listener. Each listener needs a unique port.')
-        check_port(args.port)
+        if listener_enabled(state, item):
+            check_port(args.port)
         state['listeners'].append(item)
     elif args.command == 'delete-listener':
         if not any(item['id'] == args.id for item in state['listeners']):
@@ -373,7 +456,7 @@ def execute(args, manager):
             raise ValueError('Keep at least one listener.')
         state['listeners'] = [item for item in state['listeners'] if item['id'] != args.id]
     manager.apply(state)
-    print('Saved and applied. Xray sessions were restarted.')
+    print('Saved and applied. Xray sessions restarted; SSH port selections unchanged.')
     if args.command == 'add-user':
         show_uris(state, user)
     if args.command == 'add-listener':
@@ -388,6 +471,10 @@ def main():
     os.umask(0o077)
     manager = Manager()
     try:
+        if args.command == 'allow-ssh':
+            if not manager.state_path.exists():
+                return 0
+            return 0 if port_owner(manager.load(), args.port) == 'ssh' else 1
         ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         ROOT.chmod(0o700)
         if args.command == 'render-boot':
