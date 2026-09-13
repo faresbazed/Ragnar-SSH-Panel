@@ -6,16 +6,27 @@ BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VERSION="v26.3.27"
 ROOT=/etc/ragnar/xray
 BACKUP="$ROOT/ssh-backup"
+HOOKS=(pre/ragnar-xray.sh post/ragnar-xray.sh deploy/ragnar-restart.sh)
 WORK=""
 MIGRATING=no
 SUCCESS=no
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 cleanup() {
-  local status=$?
+  local status=$? hook
+  set +e
   if [ "$MIGRATING" = yes ] && [ "$SUCCESS" != yes ]; then
     echo "Setup failed; restoring the original SSH listeners." >&2
-    systemctl disable --now ragnar-xray-expire.timer ragnar-xray.service 2>/dev/null || true
+    systemctl disable --now ragnar-xray-expire.timer 2>/dev/null || true
+    systemctl stop ragnar-xray-expire.service 2>/dev/null || true
+    systemctl disable --now ragnar-xray.service 2>/dev/null || true
+    for hook in "${HOOKS[@]}"; do
+      if [ -f "$BACKUP/hooks/$hook" ]; then
+        cp -a "$BACKUP/hooks/$hook" "/etc/letsencrypt/renewal-hooks/$hook"
+      else
+        rm -f "/etc/letsencrypt/renewal-hooks/$hook"
+      fi
+    done
     rm -f /etc/systemd/system/wsproxy.service.d/ragnar-xray.conf
     cp -a "$BACKUP/stunnel.conf" /etc/stunnel/stunnel.conf
     cp -a "$BACKUP/ssh-tls.conf" /etc/stunnel/ssh-tls.conf
@@ -83,7 +94,7 @@ for port in [444, 8080] + [entry[2] for entry in DEFAULTS if entry[2] not in (80
 PY
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl unzip python3 openssl
+apt-get install -y ca-certificates curl unzip python3 openssl util-linux
 case "$(uname -m)" in
   x86_64) ARCH=64 ;;
   aarch64|arm64) ARCH=arm64-v8a ;;
@@ -103,9 +114,16 @@ install -m 755 "$WORK/xray" /usr/local/lib/ragnar-xray/xray
 install -m 755 "$BASE/ragnar_xray.py" /usr/local/bin/ragnar-xray
 /usr/local/lib/ragnar-xray/xray version
 install -d -m 700 "$ROOT" "$BACKUP"
-# Refuse to overwrite original migration backups from an earlier failed attempt.
-[ -e "$BACKUP/stunnel.conf" ] || cp -a /etc/stunnel/stunnel.conf "$BACKUP/stunnel.conf"
-[ -e "$BACKUP/ssh-tls.conf" ] || cp -a /etc/stunnel/ssh-tls.conf "$BACKUP/ssh-tls.conf"
+# Save the currently running settings and hooks for this attempt's rollback.
+cp -a /etc/stunnel/stunnel.conf "$BACKUP/stunnel.conf"
+cp -a /etc/stunnel/ssh-tls.conf "$BACKUP/ssh-tls.conf"
+for hook in "${HOOKS[@]}"; do
+  install -d -m 700 "$BACKUP/hooks/$(dirname "$hook")"
+  rm -f "$BACKUP/hooks/$hook"
+  if [ -f "/etc/letsencrypt/renewal-hooks/$hook" ]; then
+    cp -a "/etc/letsencrypt/renewal-hooks/$hook" "$BACKUP/hooks/$hook"
+  fi
+done
 
 cat > /etc/systemd/system/ragnar-xray.service <<'UNIT'
 [Unit]
@@ -184,6 +202,10 @@ cat > /etc/letsencrypt/renewal-hooks/pre/ragnar-xray.sh <<'HOOK'
 set -eu
 umask 077
 install -d -m 700 /run/ragnar-cert-renew
+exec 9>/etc/ragnar/xray/.lock
+flock -x 9
+# Do not lose the recovery list from an interrupted renewal.
+[ ! -f /run/ragnar-cert-renew/services ] || exit 1
 : > /run/ragnar-cert-renew/services
 for service in wsproxy ragnar-xray; do
   if systemctl is-active --quiet "$service"; then
@@ -194,6 +216,9 @@ done
 HOOK
 cat > /etc/letsencrypt/renewal-hooks/post/ragnar-xray.sh <<'HOOK'
 #!/bin/bash
+umask 077
+exec 9>/etc/ragnar/xray/.lock
+flock -x 9 || exit 1
 if [ -f /run/ragnar-cert-renew/services ]; then
   failed=0
   while read -r service; do
