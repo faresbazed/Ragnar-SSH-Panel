@@ -9,7 +9,7 @@
 #   - read -r (no backslash mangling on domain/email)
 #   - Input validation for domain & email
 #   - Safe sed delimiter for domain substitution (| not affected by domain chars)
-#   - iptables rules persisted via netfilter-persistent
+#   - Dedicated DNS installer; no global port-53 NAT redirection
 #   - exec menu -> exec /usr/local/bin/menu (PATH-hash safe)
 #   - A&&B||C anti-pattern fixed with proper if blocks
 #   - Cleanup of /tmp build dirs on failure
@@ -23,7 +23,7 @@ warn(){ echo -e "${C_YLW}[ !! ]${C_NC} $1"; }
 die() { echo -e "${C_RED}[FAIL]${C_NC} $1"; exit 1; }
 
 LOGFILE="/tmp/ragnar-install.log"
-trap 'rm -rf /tmp/badvpn /tmp/dnstt /tmp/dnstt.zip /tmp/ragnar.zip 2>/dev/null' EXIT
+trap 'rm -rf /tmp/badvpn /tmp/ragnar.zip 2>/dev/null' EXIT
 
 [ "$(id -u)" -ne 0 ] && die "Run as root (sudo -i)."
 # The base installer would put SSH back on ports 80/443 and collide with Xray.
@@ -42,15 +42,7 @@ apt-get update -y >> "$LOGFILE" 2>&1
 apt-get install -y curl wget git unzip python3 stunnel4 certbot ufw >> "$LOGFILE" 2>&1 \
   || die "apt install failed - see $LOGFILE"
 
-# iptables-persistent / netfilter-persistent conflict with ufw on Ubuntu 24.04+.
-# Install them separately; if they conflict, we persist iptables via a systemd
-# unit instead (see PERSIST_IPTABLES below).
-PERSIST_IPTABLES="no"
-if apt-get install -y iptables-persistent >> "$LOGFILE" 2>&1; then
-  PERSIST_IPTABLES="yes"
-else
-  warn "iptables-persistent unavailable (ufw conflict on Noble) - using systemd unit for rule persistence"
-fi
+# DNS tunneling now binds directly to UDP 53; no NAT persistence package is needed.
 ok "Packages installed"
 
 # ---------- badvpn-udpgw (fixed build) ----------
@@ -224,90 +216,7 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-# ---------- dnstt (optional - DNS tunnel) ----------
-DNSTT_OK="no"
-info "Setting up dnstt (DNS tunnel)..."
-if ! command -v dnstt-server >/dev/null 2>&1; then
-  apt-get install -y golang-go >> "$LOGFILE" 2>&1 || warn "golang-go install failed"
-  rm -rf /tmp/dnstt /tmp/dnstt.zip
-  # 1) try maintained GitHub mirror, 2) fall back to author's tarball (no git auth)
-  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt >> "$LOGFILE" 2>&1; then
-    :
-  elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip; then
-    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) >> "$LOGFILE" 2>&1 || true
-  else
-    warn "dnstt download failed"
-  fi
-  if [ -d /tmp/dnstt ]; then
-    if ( cd /tmp/dnstt && go build ./dnstt-server >> "$LOGFILE" 2>&1 ); then
-      if [ -f /tmp/dnstt/dnstt-server ]; then
-        install -m 755 /tmp/dnstt/dnstt-server /usr/local/bin/dnstt-server
-        ok "dnstt-server built and installed"
-        DNSTT_OK="yes"
-      else
-        warn "dnstt-server binary not found after build"
-      fi
-    else
-      warn "dnstt build failed (DNS tunnel will be skipped - see $LOGFILE)"
-    fi
-  fi
-else
-  DNSTT_OK="yes"
-fi
-
-# Only configure dnstt service + keys if we actually have the binary
-if [ "$DNSTT_OK" = "yes" ] && [ -x /usr/local/bin/dnstt-server ]; then
-  mkdir -p /etc/dnstt
-  if [ ! -f /etc/dnstt/server.key ]; then
-    /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub \
-      || warn "dnstt key generation failed"
-  fi
-
-  cat > /etc/systemd/system/dnstt-server.service <<EOF
-[Unit]
-Description=dnstt DNS Tunnel (53/udp)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/dnstt-server -udp :5300 -privkey-file /etc/dnstt/server.key t.$DOMAIN 127.0.0.1:22
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  # iptables redirect 53 -> 5300, then persist so it survives reboot
-  iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
-    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-  ok "dnstt configured (DNS tunnel on port 53)"
-
-  # Persist iptables rules so they survive reboot
-  if [ "$PERSIST_IPTABLES" = "yes" ] && command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
-  else
-    # No iptables-persistent (ufw conflict on Noble) - systemd unit fallback
-    cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
-[Unit]
-Description=Ragnar SSH Panel - iptables DNAT rule for dnstt (53->5300)
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/sbin/iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-ExecStop=/sbin/iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable ragnar-iptables >/dev/null 2>&1 || true
-  fi
-else
-  warn "dnstt skipped - DNS tunnel unavailable (other features still work)"
-  warn "  You can install it later manually: see https://www.bamsoftware.com/software/dnstt/"
-fi
-
+# DNS installation is handled by the dedicated, verified installer (menu -> 9).
 
 # ---------- firewall ----------
 ufw allow 22/tcp >/dev/null 2>&1 || true
@@ -322,24 +231,14 @@ systemctl daemon-reload
 systemctl enable wsproxy badvpn-udpgw >/dev/null 2>&1
 systemctl restart wsproxy badvpn-udpgw 2>/dev/null || warn "some services failed to start (check: menu -> 5)"
 
-# Only enable/start dnstt if it was actually installed
-if [ "$DNSTT_OK" = "yes" ]; then
-  systemctl enable dnstt-server >/dev/null 2>&1 || true
-  systemctl restart dnstt-server 2>/dev/null || warn "dnstt-server failed to start"
-fi
-
 echo ""
 echo "=========================================================="
 echo "  RAGNAR SSH PANEL installed"
-echo "   SSH-WS  : 80      DNS-TUN : 53/udp $( [ "$DNSTT_OK" = "yes" ] && echo '(dnstt)' || echo '(skipped)')"
+echo "   SSH-WS  : 80      DNS-TUN : menu -> 9 (install/configure)"
 echo "   SSH-TLS : 443     UDP-GW  : 7300 (badvpn)"
 echo "   SSH     : 22      Panel   : menu (or ragnar)"
-if [ "$DNSTT_OK" = "yes" ]; then
-  echo "  Create DNS records for dnstt:"
-  echo "   A   ns.$DOMAIN     -> <VPS IP>"
-  echo "   NS  t.$DOMAIN      -> ns.$DOMAIN"
-fi
 echo "=========================================================="
 echo "  Optional VLESS / VMess / Trojan: menu -> 11 -> Install Xray"
-echo "  Xray setup asks before moving SSH-WS to 8080 and SSH-TLS to 444."
+echo "  SSH ports stay 80/443. Select SSH or Xray per port with menu -> 12."
+echo "  Fresh DNS tunnel setup: menu -> 9 -> 1 (public A/NS records required)."
 exec /usr/local/bin/menu
