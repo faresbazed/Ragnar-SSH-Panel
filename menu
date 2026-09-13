@@ -24,11 +24,7 @@ banner() {
   echo -e "${P}╔══════════════════════════════════════════════╗${N}"
   echo -e "${P}║${W}        R A G N A R   S S H   P A N E L        ${P}║${N}"
   echo -e "${P}╠══════════════════════════════════════════════╣${N}"
-  if [ -f /etc/systemd/system/wsproxy.service.d/ragnar-xray.conf ]; then
-    echo -e "${P}║${C}  SSH-WS :8080 | SSH-TLS :444 | Xray on    ${P}║${N}"
-  else
-    echo -e "${P}║${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300     ${P}║${N}"
-  fi
+  echo -e "${P}║${C}  Shared :80/:443 (SSH or Xray) | UDP :7300 ${P}║${N}"
   echo -e "${P}║${C}  DNS :53 | SSH :22                      ${P}║${N}"
   echo -e "${P}╠══════════════════════════════════════════════╣${N}"
   echo -e "${P}║${Y}  Owner : ${W}$OWNER_TG                       ${P}║${N}"
@@ -71,7 +67,12 @@ add_user() {
   fi
   mkdir -p /etc/ragnar
   echo "$u $(date +%F) +${d}days" >> /etc/ragnar/users.log
-  echo -e "${G}  ✓ User '$u' created (expires in $d days)${N}"
+  echo "  SSH user '$u' created (expires in $d days)."
+  if [ -f /etc/ragnar/xray/state.json ]; then
+    echo "  SSH users stay saved even when Xray owns a shared port."
+    read -r -p "  Choose SSH/Xray port ownership now? [y/N]: " use_ports
+    [[ ! "$use_ports" =~ ^[Yy]$ ]] || port_menu
+  fi
 }
 
 del_user() {
@@ -203,6 +204,15 @@ restart_all() {
     if ! systemctl cat "$svc" >/dev/null 2>&1; then
       continue
     fi
+    if [ -f /etc/ragnar/xray/state.json ] && [ -x /usr/local/bin/ragnar-xray ]; then
+      case "$svc" in
+        wsproxy) /usr/local/bin/ragnar-xray allow-ssh 80 || continue ;;
+        stunnel4) /usr/local/bin/ragnar-xray allow-ssh 443 || continue ;;
+      esac
+    fi
+    if ! systemctl is-enabled --quiet "$svc" && ! systemctl is-active --quiet "$svc"; then
+      continue
+    fi
     if systemctl restart "$svc" 2>/dev/null; then
       ok_count=$((ok_count+1))
     else
@@ -219,7 +229,7 @@ restart_all() {
 
 renew_cert() {
   echo -e "${Y}  Running certbot renew...${N}"
-  if certbot renew && systemctl restart stunnel4; then
+  if certbot renew && systemctl try-restart stunnel4; then
     echo -e "${G}  Certificate renewal checked; service hooks applied.${N}"
   else
     echo -e "${R}  ✗ Renew failed - run: certbot renew --dry-run${N}"
@@ -238,7 +248,8 @@ uninstall() {
   rm -f /etc/letsencrypt/renewal-hooks/{pre,post}/ragnar-xray.sh
   rm -f /etc/letsencrypt/renewal-hooks/deploy/ragnar-restart.sh
   rm -rf /run/ragnar-cert-renew /usr/local/lib/ragnar-xray
-  rm -f /usr/local/bin/ragnar-xray
+  rm -f /etc/systemd/system/{wsproxy,stunnel4}.service.d/ragnar-owner.conf
+  rm -f /usr/local/bin/ragnar-xray /usr/local/bin/ragnar-dns /usr/local/bin/dnstt-client
   systemctl stop wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
   systemctl disable wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
   rm -f /etc/systemd/system/{wsproxy,badvpn-udpgw,dnstt-server,ragnar-iptables}.service
@@ -253,189 +264,63 @@ uninstall() {
 # ==========================================================
 
 dnstt_menu() {
-  echo -e "${C}── DNS Tunnel (dnstt) ──${N}"
-  if [ -x /usr/local/bin/dnstt-server ]; then
-    echo -e "  ${G}✓ dnstt-server is installed${N}"
-  else
-    echo -e "  ${R}✗ dnstt-server is NOT installed${N}"
-  fi
-  if systemctl cat dnstt-server >/dev/null 2>&1; then
-    st=$(systemctl is-active dnstt-server 2>/dev/null)
-    echo -e "  Service: ${W}$st${N}"
-  else
-    echo -e "  Service: ${D}not configured${N}"
-  fi
-  echo ""
-  echo -e "  ${Y}1${N}) Install dnstt-server"
-  echo -e "  ${Y}2${N}) Configure & start service"
-  echo -e "  ${Y}3${N}) Show DNS records / public key"
-  echo -e "  ${Y}4${N}) Restart dnstt service"
-  echo -e "  ${Y}5${N}) Stop dnstt service"
-  echo -e "  ${Y}0${N}) Back"
-  read -r -p "  > " dc
-  case "$dc" in
-    1) dnstt_install;;
-    2) dnstt_configure;;
-    3) dnstt_info;;
-    4) systemctl restart dnstt-server 2>/dev/null && echo -e "${G}  ✓ dnstt restarted${N}" || echo -e "${R}  Failed (not configured?)${N}";;
-    5) systemctl stop dnstt-server 2>/dev/null && echo -e "${G}  ✓ dnstt stopped${N}" || echo -e "${R}  Failed${N}";;
-    0) return;;
-    *) echo -e "${R}  Invalid option${N}";;
-  esac
-}
-
-dnstt_install() {
-  echo -e "${Y}  Installing dnstt-server (may take a few minutes)...${N}"
-
-  # --- Method 1: Try prebuilt binary (fast, no Go needed) ---
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64)  PB_URL="https://github.com/Mygod/dnstt/releases/download/v20260501/dnstt-server-linux-amd64" ;;
-    aarch64) PB_URL="https://github.com/Mygod/dnstt/releases/download/v20260501/dnstt-server-linux-arm64" ;;
-    *) PB_URL="" ;;
-  esac
-  if [ -n "$PB_URL" ]; then
-    echo -e "${C}  Trying prebuilt binary ($ARCH)...${N}"
-    if wget -qO /usr/local/bin/dnstt-server "$PB_URL" 2>/dev/null && [ -s /usr/local/bin/dnstt-server ]; then
-      if [ "$(head -c4 /usr/local/bin/dnstt-server 2>/dev/null)" = "$(printf '\177ELF')" ]; then
-        chmod +x /usr/local/bin/dnstt-server
-        echo -e "${G}  ✓ dnstt-server installed (prebuilt binary)${N}"
-        return
-      fi
-      rm -f /usr/local/bin/dnstt-server
-    fi
-    echo -e "${Y}  Prebuilt binary unavailable, falling back to build from source...${N}"
-  fi
-
-  # --- Method 2: Build from source ---
-  # Install Go if not present
-  if ! command -v go >/dev/null 2>&1; then
-    echo -e "${C}  Installing golang-go...${N}"
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y golang-go >/dev/null 2>&1 || { echo -e "${R}  Failed to install golang-go${N}"; return; }
-  fi
-  echo -e "  Go version: $(go version 2>/dev/null || echo unknown)"
-  # Clone and build
-  rm -rf /tmp/dnstt /tmp/dnstt.zip
-  echo -e "${C}  Downloading dnstt source...${N}"
-  if git clone --depth 1 https://github.com/Mygod/dnstt.git /tmp/dnstt 2>&1; then
-    :
-  elif wget -qO /tmp/dnstt.zip https://www.bamsoftware.com/software/dnstt/dnstt-20260501.zip 2>/dev/null; then
-    ( cd /tmp && unzip -qo dnstt.zip && mv /tmp/dnstt-* /tmp/dnstt ) 2>/dev/null
-  else
-    echo -e "${R}  Download failed${N}"; return
-  fi
-  if [ ! -d /tmp/dnstt ]; then
-    echo -e "${R}  Source not found after download${N}"; return
-  fi
-  echo -e "${C}  Building dnstt-server (this may take 1-2 min)...${N}"
-  echo -e "  (output shown below for debugging)"
-  echo -e "  ${D}──────────────────────────────────────────${N}"
-  # Use -o to specify output name because "dnstt-server" is also a source dir
-  if ( cd /tmp/dnstt && go build -v -o /tmp/dnstt-server-bin ./dnstt-server 2>&1 ); then
-    echo -e "  ${D}──────────────────────────────────────────${N}"
-    if [ -f /tmp/dnstt-server-bin ]; then
-      install -m 755 /tmp/dnstt-server-bin /usr/local/bin/dnstt-server
-      rm -rf /tmp/dnstt /tmp/dnstt.zip /tmp/dnstt-server-bin
-      echo -e "${G}  ✓ dnstt-server installed (built from source)${N}"
-    else
-      echo -e "  ${D}──────────────────────────────────────────${N}"
-      echo -e "${R}  Build succeeded but binary not found${N}"
-    fi
-  else
-    echo -e "  ${D}──────────────────────────────────────────${N}"
-    echo -e "${R}  Build failed${N}"
-    echo -e "${Y}  You can try building manually:${N}"
-    echo -e "  ${W}cd /tmp/dnstt && go build -o /tmp/dnstt-server-bin ./dnstt-server${N}"
-  fi
-}
-
-dnstt_configure() {
-  if [ ! -x /usr/local/bin/dnstt-server ]; then
-    echo -e "${R}  dnstt-server not installed. Use option 1 first.${N}"; return
-  fi
-  d=$(get_domain)
-  echo -e "  Domain detected: ${W}$d${N}"
-  read -r -p "  Use this domain for DNS tunnel? [Y/n]: " use_d
-  if [[ "$use_d" =~ ^[Nn] ]]; then
-    read -r -p "  Enter domain for dnstt: " d
-    [ -z "$d" ] && { echo -e "${R}  Domain required${N}"; return; }
-  fi
-  # Generate keys if not present
-  mkdir -p /etc/dnstt
-  if [ ! -f /etc/dnstt/server.key ]; then
-    echo -e "${C}  Generating dnstt keys...${N}"
-    /usr/local/bin/dnstt-server -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub \
-      || { echo -e "${R}  Key generation failed${N}"; return; }
-    echo -e "${G}  ✓ Keys generated${N}"
-  fi
-  # Create systemd service
-  cat > /etc/systemd/system/dnstt-server.service <<EOF
-[Unit]
-Description=dnstt DNS Tunnel (53/udp)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/dnstt-server -udp :5300 -privkey-file /etc/dnstt/server.key t.$d 127.0.0.1:22
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  # iptables redirect 53 -> 5300
-  iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || \
-    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-  # Persist iptables rule via systemd unit (works on Ubuntu 24.04 without iptables-persistent)
-  cat > /etc/systemd/system/ragnar-iptables.service <<'EOF'
-[Unit]
-Description=Ragnar SSH Panel - iptables DNAT rule for dnstt (53->5300)
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/sbin/iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-ExecStop=/sbin/iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable dnstt-server ragnar-iptables >/dev/null 2>&1
-  systemctl start ragnar-iptables 2>/dev/null
-  systemctl restart dnstt-server 2>/dev/null
-  if systemctl is-active dnstt-server >/dev/null 2>&1; then
-    echo -e "${G}  ✓ dnstt configured and running on port 53${N}"
-  else
-    echo -e "${R}  dnstt service failed to start${N}"
-    echo -e "${Y}  Check: journalctl -xeu dnstt-server${N}"
-  fi
-}
-
-dnstt_info() {
-  if [ ! -x /usr/local/bin/dnstt-server ]; then
-    echo -e "${R}  dnstt-server not installed${N}"; return
-  fi
-  d=$(get_domain)
-  echo ""
-  echo -e "${G}╔═══ DNS Tunnel Info ════════════════════════╗${N}"
-  echo -e "${W}  DNS Zone : t.$d${N}"
-  echo -e "${W}  NS Server: ns.$d${N}"
-  echo -e "${W}  Target  : 127.0.0.1:22 (SSH)${N}"
-  echo -e "${G}╚══════════════════════════════════════════╝${N}"
-  if [ -f /etc/dnstt/server.pub ]; then
+  local choice setup
+  [ "$(id -u)" -eq 0 ] || { echo "Run menu as root."; return; }
+  while true; do
     echo ""
-    echo -e "${C}  Public key (share with clients):${N}"
-    echo -e "${Y}  $(cat /etc/dnstt/server.pub)${N}"
+    echo "  DNS tunnel (fresh official dnstt setup)"
+    echo "  1) Install / rebuild / repair DNS tunnel"
+    echo "  2) Configure domain, local IP and MTU"
+    echo "  3) Show DNS records, public key and client commands"
+    echo "  4) Diagnose LOCAL and PUBLIC tunnel connectivity"
+    echo "  5) Start/restart DNS tunnel   6) Stop DNS tunnel"
+    echo "  0) Back"
+    read -r -p "  > " choice || return
+    [ "$choice" != 0 ] || return
+    if [ "$choice" = 1 ]; then
+      setup=/opt/ragnar/install-dns.sh
+      [ -f "$setup" ] || setup="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-dns.sh"
+      if [ -f "$setup" ]; then
+        if ! bash "$setup"; then
+          echo "DNS setup failed. Read the error above; do not assume the tunnel is running."
+        fi
+      else
+        echo "Update the COMPLETE Ragnar checkout; install-dns.sh is missing."
+      fi
+      continue
+    fi
+    if [ ! -x /usr/local/bin/ragnar-dns ]; then
+      echo "Use option 1 to replace the old DNS setup first."
+      continue
+    fi
+    case "$choice" in
+      2) /usr/local/bin/ragnar-dns setup ;;
+      3) /usr/local/bin/ragnar-dns info ;;
+      4) /usr/local/bin/ragnar-dns diagnose ;;
+      5) systemctl enable --now dnstt-server && systemctl restart dnstt-server ;;
+      6) systemctl disable --now dnstt-server ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+port_menu() {
+  local port owner confirm
+  if [ ! -x /usr/local/bin/ragnar-xray ] || [ ! -f /etc/ragnar/xray/state.json ]; then
+    echo "SSH uses ports 80/443. Install/configure Xray through menu -> 11 -> 1 before switching."
+    return
   fi
-  echo ""
-  echo -e "${C}  Required DNS records:${N}"
-  echo -e "  ${W}A${N}   ns.$d     -> <your VPS IP>"
-  echo -e "  ${W}NS${N}  t.$d      -> ns.$d"
-  echo ""
-  echo -e "${C}  Client setup:${N}"
-  echo -e "  ${W}dnstt-client -pubkey-file server.pub t.$d 127.0.0.1:1080${N}"
+  /usr/local/bin/ragnar-xray ports || return
+  echo "Both sets of accounts remain saved. One service per shared port can be active."
+  echo "This does NOT change ports. Plain SSH 22 and DNS tunneling are unaffected."
+  read -r -p "  Port to switch [80/443/both, Enter cancels]: " port
+  case "$port" in 80|443|both) ;; *) return ;; esac
+  read -r -p "  Service to ENABLE [ssh/xray]: " owner
+  case "$owner" in ssh|xray) ;; *) echo "Choose ssh or xray."; return ;; esac
+  echo "The other service will be disabled on the selected port(s); its users are not deleted."
+  echo "Affected SSH tunnels and all Xray sessions may disconnect."
+  read -r -p "  Confirm switch? [yes/no]: " confirm
+  [ "$confirm" != yes ] || /usr/local/bin/ragnar-xray switch "$port" "$owner" --yes
 }
 
 # ==========================================================
@@ -449,13 +334,13 @@ xray_menu() {
   while true; do
     echo ""
     echo "  Xray: VLESS / VMess / Trojan (WS + TCP)"
-    echo "  1) Install Xray (moves SSH to WS 8080 / TLS 444)"
+    echo "  1) Install / repair Xray (SSH ports stay 80/443)"
     echo "  2) Add user          3) List users"
     echo "  4) Copy URIs         5) Set expiration date"
     echo "  6) Disable user      7) Enable user"
     echo "  8) Delete user       9) List listeners"
     echo "  10) Add listener    11) Delete listener"
-    echo "  12) Reconcile expiry now"
+    echo "  12) Reconcile expiry now   13) Switch SSH / Xray ports"
     echo "  0) Back"
     echo "  Dates: valid THROUGH selected date (UTC); expiry checked every 30s."
     echo "  Changes/expiry restart Xray and disconnect all Xray sessions."
@@ -465,7 +350,11 @@ xray_menu() {
       setup=/opt/ragnar/install-xray.sh
       [ -f "$setup" ] || setup="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-xray.sh"
       if [ -f "$setup" ]; then
-        bash "$setup"
+        if bash "$setup"; then
+          echo "Xray installation/configuration completed."
+        else
+          echo "Xray setup FAILED. Read the first error above. Retry option 1 after fixing it."
+        fi
       else
         echo "Update the full Ragnar checkout first; install-xray.sh is missing."
       fi
@@ -481,7 +370,10 @@ xray_menu() {
         read -r -p "  Protocol [vless/vmess/trojan, default vless]: " protocol
         protocol=${protocol:-vless}
         read -r -p "  Valid through (YYYY-MM-DD, UTC): " expires
-        /usr/local/bin/ragnar-xray add-user --expires "$expires" -- "$name" "$protocol"
+        if /usr/local/bin/ragnar-xray add-user --expires "$expires" -- "$name" "$protocol"; then
+          read -r -p "  Choose whether SSH or Xray owns ports 80/443 now? [y/N]: " tls
+          [[ ! "$tls" =~ ^[Yy]$ ]] || port_menu
+        fi
         ;;
       3) /usr/local/bin/ragnar-xray users ;;
       4|5|6|7|8)
@@ -524,6 +416,7 @@ xray_menu() {
         [ "$tls" != yes ] || /usr/local/bin/ragnar-xray delete-listener -- "$name"
         ;;
       12) /usr/local/bin/ragnar-xray sync ;;
+      13) port_menu ;;
       *) echo "  Invalid option." ;;
     esac
   done
@@ -543,6 +436,7 @@ while true; do
   echo -e "  ${G}7${N}) Server stats      ${G}8${N}) Renew cert"
   echo -e "  ${G}9${N}) DNS Tunnel (dnstt)${G}10${N}) Uninstall"
   echo -e "  ${G}11${N}) Xray (VLESS / VMess / Trojan)"
+  echo -e "  ${G}12${N}) Switch SSH / Xray on ports 80 and 443"
   echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${R}0${N}) Exit"
   echo ""
@@ -550,7 +444,7 @@ while true; do
   case "$o" in
     1) add_user;; 2) del_user;; 3) list_users;; 4) edit_user;;
     5) svc_status;; 6) restart_all;; 7) server_stats;; 8) renew_cert;;
-    9) dnstt_menu;; 10) uninstall;; 11) xray_menu;;
+    9) dnstt_menu;; 10) uninstall;; 11) xray_menu;; 12) port_menu;;
     0) echo -e "${P}  Bye! - $OWNER_TG | $CHANNEL_TG${N}"; exit 0;;
     *) echo -e "${R}  Invalid option${N}";;
   esac
