@@ -21,6 +21,7 @@ import uuid
 ROOT = Path('/etc/ragnar/xray')
 XRAY = '/usr/local/lib/ragnar-xray/xray'
 SERVICE = 'ragnar-xray.service'
+RENEWAL_MARKER = Path('/run/ragnar-cert-renew/services')
 UTC = dt.timezone.utc
 RESERVED = {22, 53, 444, 7300, 8080}
 DEFAULTS = [
@@ -44,6 +45,9 @@ def hostname(value):
         for part in value.split('.')
     ):
         raise ValueError('Enter a valid DNS hostname (not a URL or IP address).')
+    # Numeric IP literals should not pass DNS/certificate validation.
+    if re.fullmatch(r'[0-9.]+', value):
+        raise ValueError('Use a DNS hostname, not an IP address.')
     return value
 
 
@@ -289,6 +293,14 @@ def parser():
 
 
 def execute(args, manager):
+    # Certbot standalone owns port 80 while the pre/post hooks hold this marker.
+    # Those hooks take the same management lock, so a timer/account change cannot
+    # restart Xray between the stop and the ACME challenge. Boot rendering remains
+    # available to the post hook and still filters expired accounts before start.
+    if RENEWAL_MARKER.exists() and args.command not in ('users', 'listeners', 'uri'):
+        if args.command == 'sync':
+            return
+        raise ValueError('Certificate renewal is in progress. Retry after it completes.')
     if args.command == 'init':
         if manager.state_path.exists():
             raise ValueError('Already configured; existing users will not be overwritten.')
