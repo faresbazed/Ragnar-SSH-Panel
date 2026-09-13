@@ -3,7 +3,9 @@
 set -euo pipefail
 umask 077
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-VERSION="v26.3.27"
+# /etc/os-release sets VERSION (e.g. '24.04.3 LTS (Noble Numbat)').
+# Keep the software release separate from operating-system metadata.
+readonly XRAY_RELEASE="v26.3.27"
 ROOT=/etc/ragnar/xray
 BACKUP="$ROOT/ssh-backup"
 HOOKS=(pre/ragnar-xray.sh post/ragnar-xray.sh deploy/ragnar-restart.sh)
@@ -102,7 +104,9 @@ case "$(uname -m)" in
 esac
 WORK=$(mktemp -d)
 ASSET="Xray-linux-$ARCH.zip"
-URL="https://github.com/XTLS/Xray-core/releases/download/$VERSION/$ASSET"
+URL="https://github.com/XTLS/Xray-core/releases/download/$XRAY_RELEASE/$ASSET"
+[[ "$XRAY_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid Xray release identifier."
+echo "Downloading Xray $XRAY_RELEASE ($ARCH)..."
 curl --fail --location --retry 3 --proto '=https' -o "$WORK/$ASSET" "$URL"
 curl --fail --location --retry 3 --proto '=https' -o "$WORK/checksum" "$URL.dgst"
 SHA=$(awk '/^SHA2-256=/{print $2}' "$WORK/checksum")
