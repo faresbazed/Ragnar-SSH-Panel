@@ -24,7 +24,11 @@ banner() {
   echo -e "${P}╔══════════════════════════════════════════════╗${N}"
   echo -e "${P}║${W}        R A G N A R   S S H   P A N E L        ${P}║${N}"
   echo -e "${P}╠══════════════════════════════════════════════╣${N}"
-  echo -e "${P}║${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300     ${P}║${N}"
+  if [ -f /etc/systemd/system/wsproxy.service.d/ragnar-xray.conf ]; then
+    echo -e "${P}║${C}  SSH-WS :8080 | SSH-TLS :444 | Xray on    ${P}║${N}"
+  else
+    echo -e "${P}║${C}  SSH-WS :80 | SSH-TLS :443 | UDP :7300     ${P}║${N}"
+  fi
   echo -e "${P}║${C}  DNS :53 | SSH :22                      ${P}║${N}"
   echo -e "${P}╠══════════════════════════════════════════════╣${N}"
   echo -e "${P}║${Y}  Owner : ${W}$OWNER_TG                       ${P}║${N}"
@@ -155,7 +159,7 @@ edit_user() {
 
 svc_status() {
   echo -e "${C}── Service Status ──${N}"
-  for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
+  for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server ragnar-xray ragnar-xray-expire.timer; do
     if ! systemctl cat "$svc" >/dev/null 2>&1; then
       printf "  ${D}%-16s not installed${N}\n" "$svc"
       continue
@@ -195,7 +199,7 @@ restart_all() {
   echo -e "${Y}  Restarting services...${N}"
   systemctl daemon-reload
   local ok_count=0 fail_count=0
-  for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server; do
+  for svc in wsproxy stunnel4 badvpn-udpgw dnstt-server ragnar-xray ragnar-xray-expire.timer; do
     if ! systemctl cat "$svc" >/dev/null 2>&1; then
       continue
     fi
@@ -215,8 +219,8 @@ restart_all() {
 
 renew_cert() {
   echo -e "${Y}  Running certbot renew...${N}"
-  if certbot renew 2>/dev/null && systemctl restart stunnel4 2>/dev/null; then
-    echo -e "${G}  ✓ Cert renewed & stunnel restarted${N}"
+  if certbot renew && systemctl restart stunnel4; then
+    echo -e "${G}  Certificate renewal checked; service hooks applied.${N}"
   else
     echo -e "${R}  ✗ Renew failed - run: certbot renew --dry-run${N}"
   fi
@@ -226,6 +230,15 @@ uninstall() {
   echo -e "${R}  WARNING: This will remove Ragnar SSH Panel!${N}"
   read -r -p "  Type 'yes' to confirm: " confirm
   [ "$confirm" != "yes" ] && { echo -e "${Y}  Cancelled${N}"; return; }
+  systemctl disable --now ragnar-xray-expire.timer 2>/dev/null
+  systemctl stop ragnar-xray-expire.service ragnar-xray.service 2>/dev/null
+  systemctl disable ragnar-xray.service 2>/dev/null
+  rm -f /etc/systemd/system/ragnar-xray{,-expire}.service /etc/systemd/system/ragnar-xray-expire.timer
+  rm -f /etc/systemd/system/wsproxy.service.d/ragnar-xray.conf
+  rm -f /etc/letsencrypt/renewal-hooks/{pre,post}/ragnar-xray.sh
+  rm -f /etc/letsencrypt/renewal-hooks/deploy/ragnar-restart.sh
+  rm -rf /run/ragnar-cert-renew /usr/local/lib/ragnar-xray
+  rm -f /usr/local/bin/ragnar-xray
   systemctl stop wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
   systemctl disable wsproxy stunnel4 badvpn-udpgw dnstt-server 2>/dev/null
   rm -f /etc/systemd/system/{wsproxy,badvpn-udpgw,dnstt-server,ragnar-iptables}.service
@@ -426,6 +439,97 @@ dnstt_info() {
 }
 
 # ==========================================================
+#   XRAY - VLESS / VMESS / TROJAN
+# ==========================================================
+
+xray_menu() {
+  local choice name protocol transport port expires path tls setup
+  local -a options
+  [ "$(id -u)" -eq 0 ] || { echo "Run menu as root for Xray management."; return; }
+  while true; do
+    echo ""
+    echo "  Xray: VLESS / VMess / Trojan (WS + TCP)"
+    echo "  1) Install Xray (moves SSH to WS 8080 / TLS 444)"
+    echo "  2) Add user          3) List users"
+    echo "  4) Copy URIs         5) Set expiration date"
+    echo "  6) Disable user      7) Enable user"
+    echo "  8) Delete user       9) List listeners"
+    echo "  10) Add listener    11) Delete listener"
+    echo "  12) Reconcile expiry now"
+    echo "  0) Back"
+    echo "  Dates: valid THROUGH selected date (UTC); expiry checked every 30s."
+    echo "  Changes/expiry restart Xray and disconnect all Xray sessions."
+    read -r -p "  > " choice || return
+    [ "$choice" != 0 ] || return
+    if [ "$choice" = 1 ]; then
+      setup=/opt/ragnar/install-xray.sh
+      [ -f "$setup" ] || setup="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-xray.sh"
+      if [ -f "$setup" ]; then
+        bash "$setup"
+      else
+        echo "Update the full Ragnar checkout first; install-xray.sh is missing."
+      fi
+      continue
+    fi
+    if [ ! -x /usr/local/bin/ragnar-xray ] || [ ! -f /etc/ragnar/xray/state.json ]; then
+      echo "Install/configure Xray using option 1 first."
+      continue
+    fi
+    case "$choice" in
+      2)
+        read -r -p "  Username: " name
+        read -r -p "  Protocol [vless/vmess/trojan, default vless]: " protocol
+        protocol=${protocol:-vless}
+        read -r -p "  Valid through (YYYY-MM-DD, UTC): " expires
+        /usr/local/bin/ragnar-xray add-user --expires "$expires" -- "$name" "$protocol"
+        ;;
+      3) /usr/local/bin/ragnar-xray users ;;
+      4|5|6|7|8)
+        read -r -p "  Username: " name
+        case "$choice" in
+          4) /usr/local/bin/ragnar-xray uri -- "$name" ;;
+          5)
+            read -r -p "  New valid-through date (YYYY-MM-DD, UTC): " expires
+            /usr/local/bin/ragnar-xray renew-user --expires "$expires" -- "$name"
+            ;;
+          6) /usr/local/bin/ragnar-xray disable-user -- "$name" ;;
+          7) /usr/local/bin/ragnar-xray enable-user -- "$name" ;;
+          8)
+            read -r -p "  Permanently delete this Xray user? [yes/no]: " tls
+            [ "$tls" != yes ] || /usr/local/bin/ragnar-xray delete-user -- "$name"
+            ;;
+        esac
+        ;;
+      9) /usr/local/bin/ragnar-xray listeners ;;
+      10)
+        echo "  One listener per port. 80 = non-TLS; 443/8443/2053 = TLS."
+        echo "  WS can use Cloudflare on supported ports; TCP needs direct/DNS-only access."
+        echo "  Trojan must use TLS. Non-TLS VLESS traffic is not encrypted."
+        read -r -p "  Protocol [vless/vmess/trojan]: " protocol
+        read -r -p "  Transport [ws/tcp]: " transport
+        read -r -p "  Free port: " port
+        read -r -p "  Enable TLS? [Y/n]: " tls
+        options=()
+        [[ "$tls" =~ ^[Nn] ]] || options+=(--tls)
+        if [ "$transport" = ws ]; then
+          read -r -p "  WS path [/$protocol]: " path
+          options+=(--path "${path:-/$protocol}")
+        fi
+        /usr/local/bin/ragnar-xray add-listener "${options[@]}" -- "$protocol" "$transport" "$port"
+        ;;
+      11)
+        /usr/local/bin/ragnar-xray listeners
+        read -r -p "  Listener ID to delete: " name
+        read -r -p "  Disconnect this listener's clients? [yes/no]: " tls
+        [ "$tls" != yes ] || /usr/local/bin/ragnar-xray delete-listener -- "$name"
+        ;;
+      12) /usr/local/bin/ragnar-xray sync ;;
+      *) echo "  Invalid option." ;;
+    esac
+  done
+}
+
+# ==========================================================
 #   MAIN MENU LOOP
 # ==========================================================
 
@@ -438,6 +542,7 @@ while true; do
   echo -e "  ${G}5${N}) Service status    ${G}6${N}) Restart all"
   echo -e "  ${G}7${N}) Server stats      ${G}8${N}) Renew cert"
   echo -e "  ${G}9${N}) DNS Tunnel (dnstt)${G}10${N}) Uninstall"
+  echo -e "  ${G}11${N}) Xray (VLESS / VMess / Trojan)"
   echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${R}0${N}) Exit"
   echo ""
@@ -445,7 +550,7 @@ while true; do
   case "$o" in
     1) add_user;; 2) del_user;; 3) list_users;; 4) edit_user;;
     5) svc_status;; 6) restart_all;; 7) server_stats;; 8) renew_cert;;
-    9) dnstt_menu;; 10) uninstall;;
+    9) dnstt_menu;; 10) uninstall;; 11) xray_menu;;
     0) echo -e "${P}  Bye! - $OWNER_TG | $CHANNEL_TG${N}"; exit 0;;
     *) echo -e "${R}  Invalid option${N}";;
   esac
