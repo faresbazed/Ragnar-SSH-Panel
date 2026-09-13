@@ -26,6 +26,8 @@ LOGFILE="/tmp/ragnar-install.log"
 trap 'rm -rf /tmp/badvpn /tmp/dnstt /tmp/dnstt.zip /tmp/ragnar.zip 2>/dev/null' EXIT
 
 [ "$(id -u)" -ne 0 ] && die "Run as root (sudo -i)."
+# The base installer would put SSH back on ports 80/443 and collide with Xray.
+[ ! -e /etc/ragnar/xray/state.json ] || die "Xray is already configured. Do not rerun the base installer; update the panel files without resetting services."
 export DEBIAN_FRONTEND=noninteractive
 
 # shellcheck source=/dev/null
@@ -338,4 +340,6 @@ if [ "$DNSTT_OK" = "yes" ]; then
   echo "   NS  t.$DOMAIN      -> ns.$DOMAIN"
 fi
 echo "=========================================================="
+echo "  Optional VLESS / VMess / Trojan: menu -> 11 -> Install Xray"
+echo "  Xray setup asks before moving SSH-WS to 8080 and SSH-TLS to 444."
 exec /usr/local/bin/menu
